@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>템플릿 에디터</title>
+  <link href="https://cdn.quilljs.com/1.3.6/quill.snow.css" rel="stylesheet">
+  <style>
+    body { margin: 0; display: flex; flex-direction: column; height: 100vh; }
+    #toolbar { display: flex; justify-content: space-between; align-items: center; padding: 8px; background: #f3f3f3; }
+    #editor { flex: 1; }
+    button { margin-left: 8px; padding: 6px 12px; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <div id="format-toolbar"></div>
+    <div>
+      <button id="btnSave">저장</button>
+      <button id="btnClose">닫기</button>
+    </div>
+  </div>
+  <div id="editor"></div>
+  <script src="https://cdn.quilljs.com/1.3.6/quill.js"></script>
+  <script>
+    const quill = new Quill('#editor', {
+      theme: 'snow',
+      modules: {
+        toolbar: {
+          container: '#format-toolbar',
+          handlers: {
+            image: function() { // allow image pasting
+              const range = this.quill.getSelection();
+              const value = prompt('이미지 URL 또는 Base64 Data URL을 입력하세요');
+              if(value) {
+                this.quill.insertEmbed(range.index, 'image', value, 'user');
+              }
+            }
+          }
+        }
+      }
+    });
+
+    function setContent(html) {
+      quill.root.innerHTML = html || '';
+    }
+
+    function getContent() {
+      return quill.root.innerHTML;
+    }
+
+    document.getElementById('btnSave').addEventListener('click', () => {
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.saveContent) {
+        window.pywebview.api.saveContent(getContent()).then(() => {
+          if (window.pywebview.close) window.pywebview.close();
+        });
+      }
+    });
+
+    document.getElementById('btnClose').addEventListener('click', () => {
+      if (window.pywebview && window.pywebview.close) window.pywebview.close();
+    });
+
+    window.addEventListener('pywebviewready', () => {
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.getInitialContent) {
+        window.pywebview.api.getInitialContent().then(setContent);
+      }
+    });
+  </script>
+</body>
+</html>

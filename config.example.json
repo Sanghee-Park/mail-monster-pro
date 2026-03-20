@@ -1,0 +1,8 @@
+{
+  "외부메일_acc_1": {
+    "id": "your-email@example.com",
+    "pw": "YOUR_APP_PASSWORD",
+    "smtp": "smtp.example.com",
+    "port": "465"
+  }
+}

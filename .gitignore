@@ -1,0 +1,37 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec.bak
+
+# --- 비밀·로컬 상태 (절대 커밋 금지) ---
+credentials.json
+login_settings.json
+config.json
+recipients.json
+templates.json
+sent_history.db
+*.db
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
+
+# --- 프로젝트 내 로컬 복사본 ---
+메일몬스터 신규버전/
+
+# --- 기타 ---
+*.log
+.cursor/
+*.zip

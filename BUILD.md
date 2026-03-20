@@ -79,7 +79,7 @@ pyinstaller MAIL_MONSTER_PRO.spec
 .\scripts\build_installer.ps1
 ```
 
-- 성공 시: `dist\installer\MAIL_MONSTER_PRO_Setup_2.6.2.exe` (버전은 `installer\MAIL_MONSTER_PRO.iss`의 `#define MyAppVersion`과 `login.py` `CURRENT_VERSION`과 맞출 것)
+- 성공 시: `dist\installer\MAIL_MONSTER_PRO_Setup_2.6.3.exe` (버전은 `installer\MAIL_MONSTER_PRO.iss`의 `#define MyAppVersion`과 `login.py` `CURRENT_VERSION`과 맞출 것)
 - 한 번에 exe + sha256 (+선택 Setup): `.\scripts\package_and_deploy.ps1`
 - `pro.ico`가 없으면 `installer\MAIL_MONSTER_PRO.iss`의 `SetupIconFile` 줄을 제거하거나 주석 처리.
 

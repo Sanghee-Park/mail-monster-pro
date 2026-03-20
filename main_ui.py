@@ -87,7 +87,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.6.2"
+            CURRENT_VERSION = "v2.6.3"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686") # 💡 30% 축소 사이즈 적용
         ctk.set_appearance_mode("dark")
@@ -548,7 +548,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.6.2"
+            _ver = "v2.6.3"
         ctk.CTkLabel(header, text=f"🚀 MAIL MONSTER PRO {_ver}", font=("맑은 고딕", 18, "bold"), text_color=theme_color).pack(side="left", padx=20, pady=5)
         
         # 중앙: 통계 라벨
@@ -1662,13 +1662,14 @@ class ModernMailSender(ctk.CTk):
                     self.write_log(provider, idx, "❌ 계정 정보가 없습니다.")
                     return
                 profile = self.get_login_user_profile()
-                if not (sender_name or "").strip():
-                    sender_name = (profile.get("user_name") or "").strip() or (self.user_name or "").strip()
+                resolved_sender_name = (sender_name or "").strip()
+                if not resolved_sender_name:
+                    resolved_sender_name = (profile.get("user_name") or "").strip() or (self.user_name or "").strip()
                 sample_row = {"업체명": "테스트", "이메일": to_email}
                 final_title, final_body = self._render_message_with_variables(key, title, body, sample_row)
 
                 msg = MIMEMultipart()
-                msg['From'] = formataddr((str(Header(sender_name or "운영사무국", 'utf-8')), config['id']))
+                msg['From'] = formataddr((str(Header(resolved_sender_name or "운영사무국", 'utf-8')), config['id']))
                 msg['To'] = to_email
                 msg['Subject'] = Header(final_title, 'utf-8')
 

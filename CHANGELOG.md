@@ -1,5 +1,12 @@
 # MAIL MONSTER PRO 변경 이력
 
+## [v2.6.3] - 2026-03-20
+
+### 긴급 핫픽스
+- **테스트 발송 오류 수정**: `cannot access local variable 'sender_name' where it is not associated with a value` 스코프 오류를 해결.
+- `_start_test_send()` 내부에서 `sender_name` 재할당을 제거하고 `resolved_sender_name`로 분리해 안전하게 발신자명을 계산.
+- 발신자명 폴백(입력값 → 로그인 사용자 프로필 이름 → 로그인 사용자명) 동작을 유지.
+
 ## [v2.6.2] - 2026-03-20
 
 ### 로그인 사용자 단일 프로필 전환

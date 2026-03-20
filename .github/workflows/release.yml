@@ -1,11 +1,19 @@
 # Task 5-2: 태그 푸시 시 Windows에서 PyInstaller 빌드 후 GitHub Release에 exe 업로드
 # 사용: git tag v2.5.3 && git push origin v2.5.3
+# Release는 "Upload release assets" 단계 직전까지 안 보일 수 있음(PyInstaller 10~20분).
+# 태그 푸시 후 실패 시: Actions → 이 워크플로 → Run workflow 로 동일 태그 재실행.
 name: Build and Release (Windows)
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "빌드할 Git 태그 (예: v2.6.5)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -16,6 +24,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5

@@ -41,6 +41,12 @@ git push origin v2.6.5
 
 3. 시트 **B1** 은 비우거나 `GITHUB` → 앱이 GitHub 최신 릴리스 URL을 사용합니다.
 
+### Release가 GitHub에 안 보일 때
+
+- **정상 지연**: 태그를 올린 직후 **Releases** 탭에는 아무 것도 없을 수 있습니다. 워크플로가 **PyInstaller**를 돌리는 동안(대략 **10~20분**)은 Release가 아직 **생성되지 않습니다**. 마지막 단계 **Upload release assets**가 성공해야 `v2.6.5` Release와 exe가 보입니다.
+- **태그만 먼저 확인**: 저장소 **Code → 태그**에 `v2.6.5`가 있으면 푸시는 된 것입니다. Release는 Actions 성공 후에 나타납니다.
+- **Actions 실패**: **Actions** → **Build and Release (Windows)** → 실패한 실행 → 로그에서 `PyInstaller` 또는 `Install dependencies` 오류 확인. 워크플로에 **Run workflow**가 있으면 동일 태그(예: `v2.6.5`)를 넣고 수동 재실행할 수 있습니다.
+
 ## 4. 사용자에게 같이 줄 것
 
 - `MAIL_MONSTER_PRO.exe` 또는 Setup.exe  

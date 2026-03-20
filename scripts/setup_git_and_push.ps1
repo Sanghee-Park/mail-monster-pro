@@ -3,7 +3,8 @@
 # (Git 설치 직후 Cursor를 안 껐다면 PATH가 비어 있을 수 있음 → 아래에서 Machine+User PATH를 다시 불러옴)
 
 $ErrorActionPreference = "Stop"
-$RemoteSsh = "git@github.com:Sanghee-Park/mail-monster-pro.git"
+# SSH 미설정 PC에서는 HTTPS가 더 잘 동작합니다(Windows 자격 증명 관리자).
+$RemoteUrl = "https://github.com/Sanghee-Park/mail-monster-pro.git"
 
 # 터미널이 예전 PATH로 떠 있는 경우 대비: 레지스트리 기준 PATH로 갱신
 $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
@@ -82,7 +83,7 @@ if (-not (& $gitExe config --get user.email)) {
 }
 
 & $gitExe remote remove origin 2>$null
-& $gitExe remote add origin $RemoteSsh
+& $gitExe remote add origin $RemoteUrl
 
 & $gitExe add -A
 $status = & $gitExe status --porcelain
@@ -94,4 +95,4 @@ if ($status) {
 if ($LASTEXITCODE -ne 0) {
     Write-Error "git push 실패. SSH 키가 GitHub에 등록됐는지 확인: ssh -T git@github.com"
 }
-Write-Host "완료: $RemoteSsh (main)" -ForegroundColor Green
+Write-Host "완료: $RemoteUrl (main)" -ForegroundColor Green

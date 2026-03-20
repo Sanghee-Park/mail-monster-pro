@@ -61,7 +61,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.5.2"
+            CURRENT_VERSION = "v2.6.0"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686") # 💡 30% 축소 사이즈 적용
         ctk.set_appearance_mode("dark")
@@ -220,10 +220,11 @@ class ModernMailSender(ctk.CTk):
             con.close()
 
     def check_duplicate_send_status(self, email, template_name=""):
-        """Phase 3~4: 이메일별 sent_log 이력으로 2중 필터(Task 4-3과 동일 규칙).
-        반환: (스킵 여부, 사유) — 사유는 'other_sender' | 'same_template' | None
-        - 타 담당자(sender가 비어 있지 않고 현재 user_name과 다름)가 한 명이라도 있으면 차단
-        - 그렇지 않으면, 본인·레거시(sender 비어 있음) 이력 중 동일 템플릿이 있으면 차단
+        """수신처(이메일) 단위 규칙 — SMTP 계정(task_key)과 무관.
+        반환: (스킵 여부, 사유) — 'other_sender' | 'same_template' | None
+        - 1수신처 1담당자: 이력에 sender가 비어 있지 않고 현재 로그인 담당자와 다르면 차단(타 담당자 영역).
+        - 1수신처 동일 템플릿 1회: 본인·레거시(sender 비어 있음) 이력 중 같은 template_name 이면 차단.
+          → 다른 템플릿으로는 같은 수신처에 재발송 가능.
         """
         e = (email or "").strip()
         if not e:
@@ -470,7 +471,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.5.2"
+            _ver = "v2.6.0"
         ctk.CTkLabel(header, text=f"🚀 MAIL MONSTER PRO {_ver}", font=("맑은 고딕", 18, "bold"), text_color=theme_color).pack(side="left", padx=20, pady=5)
         
         # 중앙: 통계 라벨
@@ -1014,23 +1015,9 @@ class ModernMailSender(ctk.CTk):
                 self.write_log(p, i, "❌ 계정/수신처 부족")
                 return
 
-            # 1계정당 1템플릿 원칙 (Task 2-2: start()와 동일한 _dedup_template_key로 actual_template 고정)
+            # 템플릿 키: 수신처별 중복은 check_duplicate_send_status(이메일·담당자·템플릿)에서만 판단.
+            # (구) 1계정(task_key)당 1템플릿 제한은 제거 — 같은 수신처에 다른 템플릿은 허용, 동일 템플릿만 스킵.
             actual_template = _dedup_template_key(template_name, title)
-            con = sqlite3.connect(self.db_path)
-            try:
-                cur = con.execute(
-                    "SELECT 1 FROM sent_log WHERE task_key=? AND IFNULL(TRIM(template_name), '')<>? LIMIT 1",
-                    (key, actual_template),
-                )
-                if cur.fetchone():
-                    self.write_log(
-                        p,
-                        i,
-                        f"❌ 이미 다른 템플릿으로 발송된 기록이 있습니다. 동일 템플릿만 사용할 수 있습니다. [현재 템플릿 키: 「{actual_template}」]",
-                    )
-                    return
-            finally:
-                con.close()
 
             # --- Task 1-1 Pre-Compose: 서버 접속 전에 모든 MIME 조립 ---
             pre_composed = []

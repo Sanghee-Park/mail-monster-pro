@@ -1,0 +1,7 @@
+# 이 파일을 github_release_repo.txt 로 복사한 뒤 한 줄에 owner/repo 만 적습니다.
+# 예: Sanghee-Park/mail-monster-pro
+#
+# 앱은 시트 B1이 비어 있거나 GITHUB 일 때 이 저장소의 GitHub Releases/latest 에서
+# MAIL_MONSTER_PRO.exe 다운로드 URL을 자동으로 가져옵니다.
+
+Sanghee-Park/mail-monster-pro

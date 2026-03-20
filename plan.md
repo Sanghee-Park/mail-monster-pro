@@ -1,4 +1,4 @@
-# MAIL MONSTER PRO v2.5.2 Patch & Global Sync Plan
+# MAIL MONSTER PRO v2.6.0 Patch & Global Sync Plan
 
 **[Agent Directive - CRITICAL RULES]**
 1. **Task-by-Task Execution**: 반드시 하나의 Task가 끝나면 멈추고 보고하세요.

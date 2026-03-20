@@ -1,5 +1,17 @@
 # MAIL MONSTER PRO 변경 이력
 
+## [v2.6.0] - 2026-03-18
+
+### 발송·중복 규칙
+- **수신처(이메일) 기준**: SMTP 계정(`task_key`)당 1템플릿 제한 **제거**. 같은 수신처에 **다른 템플릿**은 발송 가능, **동일 템플릿**만 `sent_log`로 스킵.
+- **1수신처 1담당자**: `sent_log.sender`가 비어 있지 않고 현재 로그인 담당자와 다르면 타 담당자 영역으로 차단(기존 `check_duplicate_send_status` 규칙 유지).
+
+### 운영 패키징·배포
+- **릴리스 버전 정렬**: `login.py` / `main_ui.py` / Inno `MyAppVersion` → **v2.6.0**
+- **`scripts/package_and_deploy.ps1`**: PyInstaller + `MAIL_MONSTER_PRO.exe.sha256` + 선택 Inno Setup
+- **`RELEASE.md`**: 시트 A1·태그·GitHub Actions 순서 포함 운영 체크리스트
+- GitHub Actions Release에 **exe + sha256** 동시 업로드(자동 업데이트 무결성)
+
 ## [v2.5.2] - 2025-03-19
 
 ### 버그 수정
@@ -38,6 +50,17 @@
 - **Task 5-1**: `installer/MAIL_MONSTER_PRO.iss` (Inno Setup 6), `scripts/build_installer.ps1` — `dist\installer\MAIL_MONSTER_PRO_Setup_*.exe` 생성  
 - **Task 5-2**: `.github/workflows/release.yml` — `v*` 태그 푸시 시 PyInstaller 빌드 후 Release에 `MAIL_MONSTER_PRO.exe` 업로드  
 - **Task 5-3**: `scripts/github_latest_release_url.py` — 최신 릴리스 exe URL 출력; `login.py`에서 `MAILMONSTER_GITHUB_REPO` + 시트 B1 비었을 때 GitHub API 폴백
+
+### 자동 업데이트(무비용 강화)
+- 다운로드 **최대 3회 재시도**, 타임아웃 300초, 청크 64KB  
+- GitHub Release **`MAIL_MONSTER_PRO.exe.sha256`** 과 로컬 해시 비교 후에만 exe 교체  
+- 다운로드 직후 **`Unblock-File`**(MOTW 제거), 실패 시 **릴리스 페이지** 열기 + SmartScreen 안내 문구  
+- Actions: 빌드 후 `.sha256` 파일 생성·Release에 동시 업로드
+
+### GitHub 전용 업데이트
+- `login.py`: 기본 저장소 `GITHUB_RELEASE_REPO_DEFAULT` — 시트 B1 비움 또는 `GITHUB`이면 최신 Release에서 `MAIL_MONSTER_PRO.exe` URL 자동 조회  
+- `github_release_repo.txt`(선택)·`MAILMONSTER_GITHUB_REPO`·`MAILMONSTER_DISABLE_GITHUB_RELEASE` 지원  
+- `UPDATE_VIA_GITHUB.md`, `github_release_repo.txt.example` 추가
 
 ### 저장소·배포
 - 루트 `.gitignore` — `config.json`, `credentials.json`, DB 등 비밀·로컬 파일 제외  

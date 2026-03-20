@@ -1,5 +1,5 @@
 import customtkinter as ctk
-import gspread, json, os, re, subprocess, sys, unicodedata, webbrowser
+import gspread, hashlib, json, os, re, subprocess, sys, time, unicodedata, webbrowser
 from datetime import datetime
 from tkinter import messagebox
 import threading
@@ -15,8 +15,13 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Phase 6 Task 6-1: 구글 시트 버전과 비교할 앱 현재 버전
-CURRENT_VERSION = "v2.5.2"
+CURRENT_VERSION = "v2.6.0"
 SPREADSHEET_KEY = "1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw"
+
+# GitHub 릴리스 연동: 시트 B1이 비어 있거나 "GITHUB"이면 최신 Release의 .exe URL 사용 (구글 드라이브 불필요)
+# 우선순위: 환경변수 MAILMONSTER_GITHUB_REPO > BASE_DIR/github_release_repo.txt > 아래 기본값
+# 끄려면: 환경변수 MAILMONSTER_DISABLE_GITHUB_RELEASE=1
+GITHUB_RELEASE_REPO_DEFAULT = "Sanghee-Park/mail-monster-pro"
 
 
 def _strip_invisible_chars(s):
@@ -72,30 +77,113 @@ def _versions_effectively_equal(sheet_version, app_version):
     return bool(a) and bool(b) and a == b
 
 
-def _github_latest_release_asset():
-    """Task 5-3: 환경변수 MAILMONSTER_GITHUB_REPO=owner/repo 일 때 GitHub API 최신 릴리스의 .exe browser_download_url."""
+def _resolve_github_release_repo():
+    """GitHub owner/repo 문자열 (릴리스 API용)."""
+    if os.environ.get("MAILMONSTER_DISABLE_GITHUB_RELEASE", "").strip().lower() in ("1", "true", "yes"):
+        return ""
+    if "MAILMONSTER_GITHUB_REPO" in os.environ:
+        env = os.environ.get("MAILMONSTER_GITHUB_REPO", "").strip()
+        if env and "/" in env:
+            return env
+        return ""
+    path = os.path.join(BASE_DIR, "github_release_repo.txt")
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "/" in line:
+                        return line
+        except Exception:
+            pass
+    return GITHUB_RELEASE_REPO_DEFAULT
+
+
+def _github_latest_release_meta():
+    """GitHub API: 최신 Release — (tag, exe_url, sha256_hex|None, release_html_url).
+    sha256는 에셋 MAIL_MONSTER_PRO.exe.sha256 내용에서 추출(릴리스 워크플로에서 첨부)."""
     if requests is None:
-        return "", ""
-    repo = os.environ.get("MAILMONSTER_GITHUB_REPO", "").strip()
+        return "", "", None, ""
+    repo = _resolve_github_release_repo()
     if not repo or "/" not in repo:
-        return "", ""
+        return "", "", None, ""
+    headers = {"Accept": "application/vnd.github+json"}
     try:
         r = requests.get(
             f"https://api.github.com/repos/{repo}/releases/latest",
-            timeout=20,
-            headers={"Accept": "application/vnd.github+json"},
+            timeout=25,
+            headers=headers,
         )
         r.raise_for_status()
         data = r.json()
         tag = (data.get("tag_name") or "").strip()
-        for asset in data.get("assets") or []:
-            name = asset.get("name") or ""
-            if name.lower().endswith(".exe"):
-                u = (asset.get("browser_download_url") or "").strip()
-                return tag, u
-        return tag, ""
+        html_url = (data.get("html_url") or "").strip()
+        assets = data.get("assets") or []
+        sha_hex = None
+        for a in assets:
+            n = (a.get("name") or "").upper()
+            if n == "MAIL_MONSTER_PRO.EXE.SHA256":
+                u = (a.get("browser_download_url") or "").strip()
+                if u:
+                    try:
+                        ru = requests.get(u, timeout=25, headers=headers)
+                        ru.raise_for_status()
+                        m = re.search(r"[a-fA-F0-9]{64}", ru.text or "")
+                        if m:
+                            sha_hex = m.group(0).lower()
+                    except Exception:
+                        pass
+                break
+        preferred, rest = [], []
+        for a in assets:
+            n = a.get("name") or ""
+            if not n.lower().endswith(".exe"):
+                continue
+            if n.upper() == "MAIL_MONSTER_PRO.EXE":
+                preferred.append(a)
+            else:
+                rest.append(a)
+        exe_url = ""
+        for a in preferred + rest:
+            u = (a.get("browser_download_url") or "").strip()
+            if u:
+                exe_url = u
+                break
+        return tag, exe_url, sha_hex, html_url
     except Exception:
-        return "", ""
+        return "", "", None, ""
+
+
+def _file_sha256_hex(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest().lower()
+
+
+def _unblock_downloaded_file_win(path):
+    """인터넷에서 받은 파일의 Zone.Identifier 제거(무료). 일부 '차단 해제' 경고 완화에 도움."""
+    if sys.platform != "win32" or not path or not os.path.isfile(path):
+        return
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if (sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW")) else 0
+        ps_path = path.replace("'", "''")
+        subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f"Unblock-File -LiteralPath '{ps_path}'",
+            ],
+            timeout=45,
+            capture_output=True,
+            creationflags=flags,
+            check=False,
+        )
+    except Exception:
+        pass
 
 
 class LoginApp(ctk.CTk):
@@ -106,6 +194,8 @@ class LoginApp(ctk.CTk):
         self.update_required = False
         self.update_url = ""
         self.latest_version = ""
+        self.update_sha256_expected = None
+        self.update_release_page_url = ""
         self.title(f"메일 몬스터 - 보안 로그인 ({CURRENT_VERSION})")
         self.geometry("400x650")
         ctk.set_appearance_mode("dark")
@@ -153,11 +243,13 @@ class LoginApp(ctk.CTk):
             return
         self._set_update_required(latest_version, update_url)
 
-    def _set_update_required(self, latest_version, update_url):
+    def _set_update_required(self, latest_version, update_url, sha256_expected=None, release_page_url=""):
         """업데이트 필요 상태 설정 후 팝업 표시 및 다운로드 시작 (Task 6-2)"""
         self.update_required = True
         self.latest_version = latest_version
         self.update_url = update_url
+        self.update_sha256_expected = sha256_expected
+        self.update_release_page_url = (release_page_url or "").strip()
         self.withdraw()
         self._show_update_popup_and_download()
 
@@ -192,41 +284,77 @@ class LoginApp(ctk.CTk):
         download_url = _to_direct_download_url(self.update_url)
 
         def download_worker():
-            try:
-                headers = {"User-Agent": "MailMonster-Updater/1.0"}
-                r = requests.get(download_url, stream=True, timeout=60, headers=headers)
-                r.raise_for_status()
-                total = int(r.headers.get("content-length", 0)) or None
-                downloaded = 0
-                chunk_count = 0
-                with open(new_exe_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            chunk_count += 1
-                            if total and total > 0:
-                                pct = min(1.0, downloaded / total)
-                                self.after(0, lambda v=pct: prog.set(v))
-                                self.after(0, lambda v=downloaded, t=total: status_lbl.configure(text=f"{int(v*100//t)}%"))
-                            else:
-                                # Content-Length 없음(구글 드라이브 등): 청크 수로 진행 표시 (0~95%)
-                                pct = min(0.95, chunk_count * 0.002)
-                                self.after(0, lambda v=pct: prog.set(v))
-                                self.after(0, lambda d=downloaded: status_lbl.configure(text=f"다운로드 중... {d:,} bytes"))
-                self.after(0, lambda: self._on_update_download_complete(pop, new_exe_path))
-            except Exception as e:
-                self.after(0, lambda: self._on_update_download_failed(pop, str(e)))
+            last_err = None
+            headers = {"User-Agent": "MailMonster-Updater/1.0"}
+            for attempt in range(3):
+                try:
+                    r = requests.get(download_url, stream=True, timeout=300, headers=headers)
+                    r.raise_for_status()
+                    total = int(r.headers.get("content-length", 0)) or None
+                    downloaded = 0
+                    chunk_count = 0
+                    with open(new_exe_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=65536):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                chunk_count += 1
+                                if total and total > 0:
+                                    pct = min(1.0, downloaded / total)
+                                    self.after(0, lambda v=pct: prog.set(v))
+                                    self.after(0, lambda v=downloaded, t=total: status_lbl.configure(text=f"{int(v*100//t)}%"))
+                                else:
+                                    pct = min(0.95, chunk_count * 0.002)
+                                    self.after(0, lambda v=pct: prog.set(v))
+                                    self.after(0, lambda d=downloaded: status_lbl.configure(text=f"다운로드 중... {d:,} bytes"))
+                    self.after(0, lambda: self._on_update_download_complete(pop, new_exe_path))
+                    return
+                except Exception as e:
+                    last_err = e
+                    try:
+                        if os.path.isfile(new_exe_path):
+                            os.remove(new_exe_path)
+                    except Exception:
+                        pass
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+            self.after(0, lambda err=str(last_err): self._on_update_download_failed(pop, err))
 
         threading.Thread(target=download_worker, daemon=True).start()
 
     def _on_update_download_complete(self, pop, new_exe_path):
-        """Task 6-3: 다운로드 완료 → BAT 생성 및 실행 후 종료"""
+        """Task 6-3: 다운로드 완료 → 무결성 검사 → 차단 해제 → BAT로 교체 후 종료"""
         pop.destroy()
         if not os.path.exists(new_exe_path):
             messagebox.showerror("업데이트 실패", "다운로드된 파일을 찾을 수 없습니다.")
             self.deiconify()
             return
+        exp = self.update_sha256_expected
+        if exp:
+            try:
+                got = _file_sha256_hex(new_exe_path)
+                if got != exp.lower():
+                    try:
+                        os.remove(new_exe_path)
+                    except Exception:
+                        pass
+                    messagebox.showerror(
+                        "업데이트 실패",
+                        "다운로드 파일이 손상되었거나 변조되었을 수 있습니다.\n(SHA256 불일치)\n브라우저에서 릴리스 페이지를 열어 수동 설치해 주세요.",
+                    )
+                    page = (self.update_release_page_url or self.update_url or "").strip()
+                    if page:
+                        try:
+                            webbrowser.open(page)
+                        except Exception:
+                            pass
+                    self.deiconify()
+                    return
+            except Exception as e:
+                messagebox.showerror("업데이트 실패", f"파일 검증 오류: {e}")
+                self.deiconify()
+                return
+        _unblock_downloaded_file_win(new_exe_path)
         exe_path = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
         if not getattr(sys, "frozen", False):
             messagebox.showinfo("업데이트 완료", "다운로드가 완료되었습니다.\n실행 파일로 빌드된 환경에서만 자동 교체가 적용됩니다.")
@@ -253,16 +381,19 @@ del /f /q "%~f0"
 
     def _on_update_download_failed(self, pop, err_msg):
         pop.destroy()
+        page = (self.update_release_page_url or "").strip()
         url = (self.update_url or "").strip()
-        if url:
+        open_url = page or url
+        if open_url:
             try:
-                webbrowser.open(url)
+                webbrowser.open(open_url)
             except Exception:
                 pass
             messagebox.showerror(
                 "업데이트 실패",
-                "자동 다운로드에 실패했습니다. 수동으로 다운로드해 주세요.\n"
-                f"브라우저에서 링크를 열었습니다.\n\n{err_msg}",
+                "자동 다운로드에 실패했습니다. 브라우저에서 릴리스/다운로드 페이지를 열었습니다.\n"
+                "Windows가 실행을 막으면 '추가 정보' → '실행'을 눌러 주세요.\n\n"
+                f"{err_msg}",
             )
         else:
             messagebox.showerror("업데이트 실패", f"다운로드 중 오류가 발생했습니다.\n{err_msg}")
@@ -289,9 +420,12 @@ del /f /q "%~f0"
                 if d.get("auto_login"): self.pw_ent.insert(0, d.get("pw", "")); self.auto_login_var.set(True); self.after(500, self.check_login)
 
     def _fetch_update_info(self):
-        """설정 시트에서 최신 버전/다운로드 URL을 조회. Task 1-1: strip() 적용.
-        Task 5-3: 시트 B1이 비어 있으면 환경변수 MAILMONSTER_GITHUB_REPO 가 있을 때 GitHub 최신 릴리스 exe URL을 사용."""
+        """설정 시트 A1=최신 버전, B1=다운로드 URL.
+        B1이 비어 있거나 'GITHUB'/'GIT'(대소문자 무시)이면 GitHub 최신 Release의 exe URL 사용 (기본 저장소: GITHUB_RELEASE_REPO_DEFAULT).
+        B1에 직접 URL을 넣으면 그대로 사용(수동 덮어쓰기).
+        반환: (latest, url, sha256_hex|None, release_page_url) — GitHub 자동일 때만 sha256·릴리스 페이지 채움."""
         latest, url = "", ""
+        sha256_hex, release_page = None, ""
         try:
             cred_path = os.path.join(BASE_DIR, "credentials.json")
             if os.path.exists(cred_path):
@@ -301,16 +435,22 @@ del /f /q "%~f0"
                 v = ws.acell("A1").value
                 u = ws.acell("B1").value
                 latest = str(v).strip() if v is not None else ""
-                url = str(u).strip() if u is not None else ""
+                raw_b = str(u).strip() if u is not None else ""
+                if raw_b.lower() in ("", "github", "git"):
+                    url = ""
+                else:
+                    url = raw_b
         except Exception:
             pass
         if not url:
-            gh_tag, gh_url = _github_latest_release_asset()
+            gh_tag, gh_url, gh_sha, gh_page = _github_latest_release_meta()
             if gh_url:
                 url = gh_url
+                sha256_hex = gh_sha
+                release_page = gh_page
                 if not latest and gh_tag:
                     latest = gh_tag
-        return latest, url
+        return latest, url, sha256_hex, release_page
 
     def _launch_main_app(self, user_name, grade, rem):
         self.withdraw()
@@ -319,7 +459,7 @@ del /f /q "%~f0"
 
     def _check_update_after_login(self, user_name, grade, rem):
         """로그인 성공 직후 버전 확인: 같으면 실행, 다르면 권고 후 업데이트."""
-        latest_version, update_url = self._fetch_update_info()
+        latest_version, update_url, sha256_exp, release_page = self._fetch_update_info()
         # A1에 버전이 있고 앱과 동일하면 B1(URL) 유무와 관계없이 즉시 실행 (같은 버전인데도 권고 팝업 방지)
         if latest_version and _versions_effectively_equal(latest_version, CURRENT_VERSION):
             self._launch_main_app(user_name, grade, rem)
@@ -336,7 +476,7 @@ del /f /q "%~f0"
         )
         do_update = messagebox.askyesno("업데이트 권고", msg)
         if do_update:
-            self._set_update_required(latest_version, update_url)
+            self._set_update_required(latest_version, update_url, sha256_exp, release_page)
         else:
             self._launch_main_app(user_name, grade, rem)
 

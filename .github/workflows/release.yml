@@ -31,10 +31,19 @@ jobs:
       - name: PyInstaller
         run: pyinstaller MAIL_MONSTER_PRO.spec --noconfirm
 
-      - name: Upload release asset
+      # 앱이 자동 업데이트 시 다운로드 무결성 검사(무료) — login.py 가 이 파일명을 찾음
+      - name: Write SHA256 sidecar
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash -Path "dist/MAIL_MONSTER_PRO.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path "dist/MAIL_MONSTER_PRO.exe.sha256" -Value $h -Encoding ascii
+
+      - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/MAIL_MONSTER_PRO.exe
+          files: |
+            dist/MAIL_MONSTER_PRO.exe
+            dist/MAIL_MONSTER_PRO.exe.sha256
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

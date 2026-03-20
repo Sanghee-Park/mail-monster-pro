@@ -13,6 +13,8 @@ build/
 *.spec.bak
 
 # --- 비밀·로컬 상태 (절대 커밋 금지) ---
+# fork/별도 저장소용 로컬 오버라이드 (예시는 github_release_repo.txt.example)
+github_release_repo.txt
 credentials.json
 login_settings.json
 config.json

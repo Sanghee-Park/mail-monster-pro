@@ -87,7 +87,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.6.4"
+            CURRENT_VERSION = "v2.6.5"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686") # 💡 30% 축소 사이즈 적용
         ctk.set_appearance_mode("dark")
@@ -247,15 +247,17 @@ class ModernMailSender(ctk.CTk):
             con.close()
 
     def check_duplicate_send_status(self, email, template_name=""):
-        """v2.6.2 Phase 1 Task 1-1: 담당자(sender)와 무관하게, 동일 수신 이메일 + 동일 템플릿명만 스킵.
+        """v2.6.5: 같은 사용자+같은 이메일+같은 템플릿만 스킵.
         반환: (스킵 여부, 사유, 이전_발송자_표시명)
-        - 사유: 스킵 시 'same_template', 아니면 None. 이전 발송자는 로그용(스킵이 아니면 None).
-        - 타 담당자 차단 규칙 없음: 템플릿이 다르면 누가 보냈든 재발송 허용.
+        - 타 사용자 이력은 스킵 사유가 아님(발송 허용).
         """
         e = (email or "").strip()
         if not e:
             return False, None, None
         tpl_key = (template_name or "").strip().lower()
+        me = (self.user_name or "").strip().lower()
+        if not me:
+            return False, None, None
         con = sqlite3.connect(self.db_path)
         try:
             cur = con.execute(
@@ -268,10 +270,13 @@ class ModernMailSender(ctk.CTk):
         if not rows:
             return False, None, None
         for sender, tmpl_db in rows:
+            s = (sender or "").strip().lower()
+            if not s or s != me:
+                continue
             t = (tmpl_db or "").strip().lower()
             if t == tpl_key:
                 prior = (sender or "").strip() or "(미기록)"
-                return True, "same_template", prior
+                return True, "same_template_same_sender", prior
         return False, None, None
 
     def _profile_key_for_login_user(self):
@@ -548,7 +553,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.6.4"
+            _ver = "v2.6.5"
         ctk.CTkLabel(header, text=f"🚀 MAIL MONSTER PRO {_ver}", font=("맑은 고딕", 18, "bold"), text_color=theme_color).pack(side="left", padx=20, pady=5)
         
         # 중앙: 통계 라벨
@@ -1063,16 +1068,17 @@ class ModernMailSender(ctk.CTk):
         interval_cb.set("5분")
         interval_cb.pack(side="left")
 
+        prevent_dup_var = ctk.BooleanVar(value=True)
         ctk.CTkLabel(
             interval_f,
-            text="중복 차단 비활성화: 공유시트 발송내역만 기록합니다.",
+            text="중복 차단: 같은 사용자+같은 이메일+같은 템플릿만 스킵합니다.",
             font=("맑은 고딕", 11),
         ).pack(side="left", padx=12)
 
         def start():
             self.stop_flags[task_key] = False
             interval = interval_cb.get()
-            prevent_dup = False
+            prevent_dup = prevent_dup_var.get()
             profile = self.get_login_user_profile()
             merged_text = f"{title_e.get()}\n{body_t.get('1.0', 'end-1c')}"
             used_tags = [t for t in ("{{내이름}}", "{{내직책}}", "{{내전화번호}}", "{{내이메일}}") if t in merged_text]
@@ -1363,7 +1369,7 @@ class ModernMailSender(ctk.CTk):
                 self.write_log(p, i, "❌ 계정/수신처 부족")
                 return
 
-            # v2.6.2: 수신 이메일 + 템플릿 키가 sent_log에 있으면 스킵(발송 담당자 무관). 다른 템플릿은 허용.
+            # v2.6.5: 같은 사용자+같은 이메일+같은 템플릿만 스킵.
             actual_template = _dedup_template_key(template_name, title)
 
             # --- Task 1-1 Pre-Compose: 서버 접속 전에 모든 MIME 조립 ---
@@ -1375,6 +1381,17 @@ class ModernMailSender(ctk.CTk):
                 email = row_data.get("이메일") or row_data.get("email", "")
                 no = idx
                 try:
+                    if prevent_dup:
+                        dup, dup_reason, prior_sender = self.check_duplicate_send_status(
+                            email, actual_template
+                        )
+                        if dup and dup_reason == "same_template_same_sender":
+                            self.write_log(
+                                p,
+                                i,
+                                f"🚫 [{idx}/{len(all_rows)}] 스킵: {comp} (동일 사용자·동일 템플릿 재발송) <{email}> 「{actual_template}」",
+                            )
+                            continue
                     if self._is_blacklisted(email):
                         self.write_log(p, i, f"🚫 [{idx}/{len(all_rows)}] {comp} <{email}> 스킵(수신 거부 업체)")
                         continue

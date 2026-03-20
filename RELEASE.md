@@ -1,4 +1,4 @@
-# MAIL MONSTER PRO — 운영 배포 체크리스트 (v2.6.4 기준)
+# MAIL MONSTER PRO — 운영 배포 체크리스트 (v2.6.5 기준)
 
 ## 1. 버전 한 곳에서 맞추기
 
@@ -6,10 +6,10 @@
 
 | 위치 | 형식 예 |
 |------|---------|
-| `login.py` → `CURRENT_VERSION` | `v2.6.4` |
-| `installer/MAIL_MONSTER_PRO.iss` → `#define MyAppVersion` | `2.6.4` (v 없음) |
-| 구글 시트 `설정` **A1** | `v2.6.4` (사용자에게 보이는 최신 버전) |
-| Git 태그 | `v2.6.4` |
+| `login.py` → `CURRENT_VERSION` | `v2.6.5` |
+| `installer/MAIL_MONSTER_PRO.iss` → `#define MyAppVersion` | `2.6.5` (v 없음) |
+| 구글 시트 `설정` **A1** | `v2.6.5` (사용자에게 보이는 최신 버전) |
+| Git 태그 | `v2.6.5` |
 
 ## 2. 로컬 패키징 (Windows)
 
@@ -23,7 +23,7 @@
 
 - `dist\MAIL_MONSTER_PRO.exe` — 배포용 단일 실행 파일  
 - `dist\MAIL_MONSTER_PRO.exe.sha256` — 자동 업데이트 무결성용 (GitHub Release에 함께 올림)  
-- (Inno Setup 설치 시) `dist\installer\MAIL_MONSTER_PRO_Setup_2.6.4.exe`
+- (Inno Setup 설치 시) `dist\installer\MAIL_MONSTER_PRO_Setup_2.6.5.exe`
 
 ## 3. GitHub Release (자동 업데이트 연동)
 
@@ -31,10 +31,10 @@
 
 ```bash
 git add -A
-git commit -m "release: v2.6.4"
-git tag v2.6.4
+git commit -m "release: v2.6.5"
+git tag v2.6.5
 git push origin main
-git push origin v2.6.4
+git push origin v2.6.5
 ```
 
 2. Actions **Build and Release** 가 `MAIL_MONSTER_PRO.exe` + `.sha256` 을 Release에 올립니다.

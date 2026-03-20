@@ -3,12 +3,6 @@
     "id": "your-email@example.com",
     "pw": "YOUR_APP_PASSWORD",
     "smtp": "smtp.example.com",
-    "port": "465",
-    "sender_profile": {
-      "user_name": "홍길동",
-      "user_rank": "대리",
-      "user_phone": "010-0000-0000",
-      "user_email": "your-email@example.com"
-    }
+    "port": "465"
   }
 }

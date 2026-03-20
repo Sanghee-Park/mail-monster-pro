@@ -15,7 +15,7 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Phase 6 Task 6-1: 구글 시트 버전과 비교할 앱 현재 버전
-CURRENT_VERSION = "v2.6.1"
+CURRENT_VERSION = "v2.6.2"
 SPREADSHEET_KEY = "1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw"
 
 # GitHub 릴리스 연동: 시트 B1이 비어 있거나 "GITHUB"이면 최신 Release의 .exe URL 사용 (구글 드라이브 불필요)
@@ -360,20 +360,42 @@ class LoginApp(ctk.CTk):
             messagebox.showinfo("업데이트 완료", "다운로드가 완료되었습니다.\n실행 파일로 빌드된 환경에서만 자동 교체가 적용됩니다.")
             self.deiconify()
             return
-        bat_path = os.path.join(BASE_DIR, "_update_runner.bat")
-        orig_name = os.path.basename(exe_path)
-        bat_content = f"""@echo off
-ping -n 3 127.0.0.1 > nul
-del /f /q "{exe_path}"
-ren "{new_exe_path}" "{orig_name}"
-start "" "{os.path.join(BASE_DIR, orig_name)}"
-del /f /q "%~f0"
+        ps_path = os.path.join(BASE_DIR, "_update_runner.ps1")
+        exe_ps = exe_path.replace("'", "''")
+        new_ps = new_exe_path.replace("'", "''")
+        script_ps = ps_path.replace("'", "''")
+        ps_content = f"""$ErrorActionPreference = 'SilentlyContinue'
+Start-Sleep -Seconds 2
+for ($i=0; $i -lt 20; $i++) {{
+    try {{
+        Remove-Item -LiteralPath '{exe_ps}' -Force -ErrorAction Stop
+        break
+    }} catch {{
+        Start-Sleep -Milliseconds 500
+    }}
+}}
+Move-Item -LiteralPath '{new_ps}' -Destination '{exe_ps}' -Force
+Start-Process -FilePath '{exe_ps}'
+Start-Sleep -Milliseconds 500
+Remove-Item -LiteralPath '{script_ps}' -Force
 """
         try:
-            with open(bat_path, "w", encoding="utf-8") as f:
-                f.write(bat_content)
+            with open(ps_path, "w", encoding="utf-8") as f:
+                f.write(ps_content)
             flags = subprocess.CREATE_NO_WINDOW if (sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW")) else 0
-            subprocess.Popen(["cmd", "/c", bat_path], creationflags=flags, cwd=BASE_DIR)
+            subprocess.Popen(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    ps_path,
+                ],
+                creationflags=flags,
+                cwd=BASE_DIR,
+            )
             os._exit(0)
         except Exception as e:
             messagebox.showerror("업데이트 실패", f"배치 실행 오류: {e}")

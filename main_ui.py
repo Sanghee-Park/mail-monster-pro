@@ -76,6 +76,7 @@ class ModernMailSender(ctk.CTk):
         super().__init__()
         self.user_name, self.grade, self.remaining = user_name, grade, remaining
         self.config_file = os.path.join(BASE_DIR, "config.json")
+        self.user_profiles_file = os.path.join(BASE_DIR, "user_profiles.json")
         self.template_file = os.path.join(BASE_DIR, "templates.json")
         self.recipients_file = os.path.join(BASE_DIR, "recipients.json")
         self.db_path = os.path.join(BASE_DIR, "sent_history.db")
@@ -86,17 +87,18 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.6.1"
+            CURRENT_VERSION = "v2.6.2"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686") # 💡 30% 축소 사이즈 적용
         ctk.set_appearance_mode("dark")
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         
-        for f in [self.config_file, self.template_file]:
+        for f in [self.config_file, self.template_file, self.user_profiles_file]:
             if not os.path.exists(f): 
                 with open(f, 'w', encoding='utf-8') as file: json.dump({}, file)
         if not os.path.exists(self.recipients_file):
             with open(self.recipients_file, 'w', encoding='utf-8') as file: json.dump({}, file, ensure_ascii=False, indent=2)
+        self._migrate_legacy_sender_profile_once()
         self.init_db()
         self.setup_ui()
         # Phase 3 Task 3-1: 구글 시트 '발송내역' → 로컬 DB 동기화 (비동기)
@@ -245,7 +247,7 @@ class ModernMailSender(ctk.CTk):
             con.close()
 
     def check_duplicate_send_status(self, email, template_name=""):
-        """v2.6.1 Phase 1 Task 1-1: 담당자(sender)와 무관하게, 동일 수신 이메일 + 동일 템플릿명만 스킵.
+        """v2.6.2 Phase 1 Task 1-1: 담당자(sender)와 무관하게, 동일 수신 이메일 + 동일 템플릿명만 스킵.
         반환: (스킵 여부, 사유, 이전_발송자_표시명)
         - 사유: 스킵 시 'same_template', 아니면 None. 이전 발송자는 로그용(스킵이 아니면 None).
         - 타 담당자 차단 규칙 없음: 템플릿이 다르면 누가 보냈든 재발송 허용.
@@ -272,13 +274,63 @@ class ModernMailSender(ctk.CTk):
                 return True, "same_template", prior
         return False, None, None
 
-    def get_sender_profile(self, task_key):
-        """Phase 2 Task 2-2: SMTP 계정(task_key)별 발송자 프로필 (이름·직책·전화·이메일)."""
+    def _profile_key_for_login_user(self):
+        return (self.user_name or "").strip() or "default_user"
+
+    def load_user_profiles(self):
+        try:
+            with open(self.user_profiles_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def save_user_profiles(self, profiles):
+        with open(self.user_profiles_file, "w", encoding="utf-8") as f:
+            json.dump(profiles if isinstance(profiles, dict) else {}, f, indent=2, ensure_ascii=False)
+
+    def get_login_user_profile(self):
+        profiles = self.load_user_profiles()
+        key = self._profile_key_for_login_user()
+        d = _default_sender_profile_dict()
+        p = profiles.get(key)
+        if isinstance(p, dict):
+            for k in d:
+                if p.get(k) is not None:
+                    d[k] = str(p.get(k)).strip()
+        if not d.get("user_name"):
+            d["user_name"] = (self.user_name or "").strip()
+        return d
+
+    def save_login_user_profile(self, profile):
+        d = _default_sender_profile_dict()
+        if isinstance(profile, dict):
+            for k in d:
+                if profile.get(k) is not None:
+                    d[k] = str(profile.get(k)).strip()
+        if not d.get("user_name"):
+            d["user_name"] = (self.user_name or "").strip()
+        profiles = self.load_user_profiles()
+        profiles[self._profile_key_for_login_user()] = d
+        self.save_user_profiles(profiles)
+
+    def _migrate_legacy_sender_profile_once(self):
+        """구버전 config.json의 계정별 sender_profile을 로그인 사용자 프로필로 1회 이관."""
+        current = self.get_login_user_profile()
+        if any((current.get(k) or "").strip() for k in ("user_rank", "user_phone", "user_email")):
+            return
         try:
             with open(self.config_file, "r", encoding="utf-8") as f:
-                return _parse_sender_profile_from_entry(json.load(f).get(task_key))
+                cfg = json.load(f)
         except Exception:
-            return _default_sender_profile_dict()
+            return
+        if not isinstance(cfg, dict):
+            return
+        for entry in cfg.values():
+            sp = _parse_sender_profile_from_entry(entry)
+            if any((sp.get(k) or "").strip() for k in ("user_name", "user_rank", "user_phone", "user_email")):
+                self.save_login_user_profile(sp)
+                return
 
     def _ensure_sent_log_worksheet(self, spreadsheet):
         """Phase 3: 워크시트 '발송내역'이 없으면 헤더와 함께 생성."""
@@ -496,7 +548,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.6.1"
+            _ver = "v2.6.2"
         ctk.CTkLabel(header, text=f"🚀 MAIL MONSTER PRO {_ver}", font=("맑은 고딕", 18, "bold"), text_color=theme_color).pack(side="left", padx=20, pady=5)
         
         # 중앙: 통계 라벨
@@ -506,6 +558,15 @@ class ModernMailSender(ctk.CTk):
         
         # 우측: 사용자 이름
         ctk.CTkLabel(header, text=f"✨ {self.user_name} 님", font=self._font_body).pack(side="right", padx=20, pady=5)
+        ctk.CTkButton(
+            header,
+            text="👤 내 프로필",
+            width=110,
+            height=35,
+            font=self._font_small,
+            fg_color="#8e44ad",
+            command=self._open_user_profile_popup,
+        ).pack(side="right", padx=5, pady=5)
         
         # 우측: Phase 5 Task 5-2 차단 목록 최신화 + 블랙리스트 관리
         def _run_sync_blacklist():
@@ -676,6 +737,49 @@ class ModernMailSender(ctk.CTk):
         self.profile_frames[task_key].pack(fill="both", expand=True)
         self.current_profile = task_key
 
+    def _open_user_profile_popup(self):
+        """로그인 사용자 단일 프로필 편집 팝업."""
+        pop = ctk.CTkToplevel(self)
+        pop.title("내 프로필")
+        pop.geometry("430x420")
+        pop.attributes("-topmost", True)
+
+        profile = self.get_login_user_profile()
+        ctk.CTkLabel(pop, text=f"로그인 사용자: {self.user_name}", font=self._font_small, text_color="#95a5a6").pack(anchor="w", padx=16, pady=(14, 8))
+        ctk.CTkLabel(pop, text="발송자 정보", font=self._font_title).pack(anchor="w", padx=16, pady=(0, 8))
+        _e = {"width": 360, "height": 36, "font": self._font_body}
+        e_name = ctk.CTkEntry(pop, placeholder_text="이름 (user_name)", **_e); e_name.pack(pady=5)
+        e_rank = ctk.CTkEntry(pop, placeholder_text="직책 (user_rank)", **_e); e_rank.pack(pady=5)
+        e_phone = ctk.CTkEntry(pop, placeholder_text="전화번호 (user_phone)", **_e); e_phone.pack(pady=5)
+        e_email = ctk.CTkEntry(pop, placeholder_text="이메일 (user_email)", **_e); e_email.pack(pady=5)
+        if profile.get("user_name"): e_name.insert(0, profile.get("user_name", ""))
+        if profile.get("user_rank"): e_rank.insert(0, profile.get("user_rank", ""))
+        if profile.get("user_phone"): e_phone.insert(0, profile.get("user_phone", ""))
+        if profile.get("user_email"): e_email.insert(0, profile.get("user_email", ""))
+
+        ctk.CTkLabel(
+            pop,
+            text="모든 SMTP 계정에서 동일한 내 프로필이 공통 사용됩니다.",
+            font=("맑은 고딕", 10),
+            text_color="#95a5a6",
+        ).pack(anchor="w", padx=16, pady=(8, 10))
+
+        def _save():
+            data = {
+                "user_name": e_name.get().strip(),
+                "user_rank": e_rank.get().strip(),
+                "user_phone": e_phone.get().strip(),
+                "user_email": e_email.get().strip(),
+            }
+            self.save_login_user_profile(data)
+            messagebox.showinfo("저장 완료", "내 프로필이 저장되었습니다.", parent=pop)
+            pop.destroy()
+
+        btn_row = ctk.CTkFrame(pop, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(2, 8))
+        ctk.CTkButton(btn_row, text="저장", width=120, fg_color="#28a745", command=_save).pack(side="left")
+        ctk.CTkButton(btn_row, text="닫기", width=120, command=pop.destroy).pack(side="right")
+
     def build_account_detail(self, parent, provider, idx):
         task_key = f"{provider}_{idx}"
         func_tabs = ctk.CTkTabview(parent, segmented_button_fg_color="#333333")
@@ -697,24 +801,21 @@ class ModernMailSender(ctk.CTk):
         e_smtp.pack(pady=5)
         e_port = ctk.CTkEntry(setup_box, placeholder_text="포트 (465)", **_e)
         e_port.pack(pady=5)
-
-        sender_box = ctk.CTkFrame(t1_scroll, fg_color=("#2f2f2f", "#252525"), corner_radius=10, border_width=1, border_color="#3d3d3d")
-        sender_box.pack(fill="x", pady=(16, 8), padx=2)
-        ctk.CTkLabel(sender_box, text="발송자 정보", font=self._font_title).pack(anchor="w", padx=12, pady=(12, 6))
         ctk.CTkLabel(
-            sender_box,
-            text="메일 본문의 {{내이름}} 등 변수에 쓰입니다. (계정마다 따로 저장)",
-            font=("맑은 고딕", 11),
+            setup_box,
+            text="발송자 정보는 로그인 사용자 기준으로 공통 사용됩니다.",
+            font=("맑은 고딕", 10),
             text_color="#95a5a6",
-        ).pack(anchor="w", padx=12, pady=(0, 8))
-        e_prof_name = ctk.CTkEntry(sender_box, placeholder_text="이름 (user_name)", **_e)
-        e_prof_name.pack(pady=4, padx=12)
-        e_prof_rank = ctk.CTkEntry(sender_box, placeholder_text="직책 (user_rank)", **_e)
-        e_prof_rank.pack(pady=4, padx=12)
-        e_prof_phone = ctk.CTkEntry(sender_box, placeholder_text="전화번호 (user_phone)", **_e)
-        e_prof_phone.pack(pady=4, padx=12)
-        e_prof_email = ctk.CTkEntry(sender_box, placeholder_text="이메일 (user_email)", **_e)
-        e_prof_email.pack(pady=4, padx=12)
+        ).pack(anchor="w", pady=(6, 2))
+        ctk.CTkButton(
+            setup_box,
+            text="👤 내 프로필 열기",
+            width=160,
+            height=30,
+            fg_color="#8e44ad",
+            command=self._open_user_profile_popup,
+            font=("맑은 고딕", 10),
+        ).pack(anchor="w", pady=(0, 6))
 
         try:
             with open(self.config_file, "r", encoding="utf-8") as f:
@@ -728,42 +829,8 @@ class ModernMailSender(ctk.CTk):
                         e_smtp.insert(0, d["smtp"])
                     if d.get("port"):
                         e_port.insert(0, str(d["port"]))
-                sp = _parse_sender_profile_from_entry(d)
-                if sp.get("user_name"):
-                    e_prof_name.insert(0, sp["user_name"])
-                if sp.get("user_rank"):
-                    e_prof_rank.insert(0, sp["user_rank"])
-                if sp.get("user_phone"):
-                    e_prof_phone.insert(0, sp["user_phone"])
-                if sp.get("user_email"):
-                    e_prof_email.insert(0, sp["user_email"])
         except Exception:
             pass
-
-        def _read_sender_profile_from_ui():
-            return {
-                "user_name": e_prof_name.get().strip(),
-                "user_rank": e_prof_rank.get().strip(),
-                "user_phone": e_prof_phone.get().strip(),
-                "user_email": e_prof_email.get().strip(),
-            }
-
-        def save_sender_profile_only():
-            try:
-                with open(self.config_file, "r+", encoding="utf-8") as f:
-                    data = json.load(f)
-                    prev = data.get(task_key)
-                    if not isinstance(prev, dict):
-                        prev = {}
-                    prev = {**prev, "sender_profile": _read_sender_profile_from_ui()}
-                    data[task_key] = prev
-                    f.seek(0)
-                    json.dump(data, f, indent=4, ensure_ascii=False)
-                    f.truncate()
-                self.write_log(provider, idx, "✅ 발송자 정보 저장됨")
-                messagebox.showinfo("저장 완료", "이 계정의 발송자 정보가 저장되었습니다.", parent=t1)
-            except Exception as e:
-                messagebox.showerror("저장 실패", str(e), parent=t1)
 
         def verify():
             uid, upw, usmtp, uport = e_id.get().strip(), e_pw.get().strip(), e_smtp.get().strip(), e_port.get().strip()
@@ -775,20 +842,11 @@ class ModernMailSender(ctk.CTk):
                     server.quit()
                     with open(self.config_file, "r+", encoding="utf-8") as f:
                         data = json.load(f)
-                        prev = data.get(task_key)
-                        sp = _read_sender_profile_from_ui()
-                        if isinstance(prev, dict) and isinstance(prev.get("sender_profile"), dict):
-                            # UI가 비어 있으면 기존 sender_profile 유지
-                            old = prev.get("sender_profile") or {}
-                            for k in sp:
-                                if not sp[k] and old.get(k):
-                                    sp[k] = str(old.get(k) or "").strip()
                         data[task_key] = {
                             "id": uid,
                             "pw": upw,
                             "smtp": usmtp,
                             "port": uport,
-                            "sender_profile": sp,
                         }
                         f.seek(0)
                         json.dump(data, f, indent=4, ensure_ascii=False)
@@ -809,15 +867,6 @@ class ModernMailSender(ctk.CTk):
             height=38,
             font=self._font_small,
         ).pack(pady=12)
-        ctk.CTkButton(
-            sender_box,
-            text="발송자 정보만 저장",
-            fg_color="#1f538d",
-            command=save_sender_profile_only,
-            width=320,
-            height=36,
-            font=self._font_small,
-        ).pack(pady=(4, 14), padx=12)
 
         list_f = ctk.CTkFrame(t2, fg_color="transparent")
         list_f.pack(fill="both", expand=True, padx=8, pady=8)
@@ -1025,7 +1074,7 @@ class ModernMailSender(ctk.CTk):
             self.stop_flags[task_key] = False
             interval = interval_cb.get()
             prevent_dup = prevent_dup_var.get()
-            profile = self.get_sender_profile(task_key)
+            profile = self.get_login_user_profile()
             merged_text = f"{title_e.get()}\n{body_t.get('1.0', 'end-1c')}"
             used_tags = [t for t in ("{{내이름}}", "{{내직책}}", "{{내전화번호}}", "{{내이메일}}") if t in merged_text]
             missing = []
@@ -1116,10 +1165,10 @@ class ModernMailSender(ctk.CTk):
             result = result.replace(placeholder, str(value or ""))
         return result
 
-    def replace_user_variables(self, text, task_key):
-        """Phase 3 Task 3-1: 발송자 정보 태그({{내이름}} 등) 치환."""
+    def replace_user_variables(self, text, task_key=None):
+        """로그인 사용자 프로필 기반 발송자 정보 태그({{내이름}} 등) 치환."""
         result = str(text or "")
-        profile = self.get_sender_profile(task_key)
+        profile = self.get_login_user_profile()
         mapping = {
             "{{내이름}}": profile.get("user_name", ""),
             "{{내직책}}": profile.get("user_rank", ""),
@@ -1315,7 +1364,7 @@ class ModernMailSender(ctk.CTk):
                 self.write_log(p, i, "❌ 계정/수신처 부족")
                 return
 
-            # v2.6.1: 수신 이메일 + 템플릿 키가 sent_log에 있으면 스킵(발송 담당자 무관). 다른 템플릿은 허용.
+            # v2.6.2: 수신 이메일 + 템플릿 키가 sent_log에 있으면 스킵(발송 담당자 무관). 다른 템플릿은 허용.
             actual_template = _dedup_template_key(template_name, title)
 
             # --- Task 1-1 Pre-Compose: 서버 접속 전에 모든 MIME 조립 ---
@@ -1612,7 +1661,7 @@ class ModernMailSender(ctk.CTk):
                 if not config:
                     self.write_log(provider, idx, "❌ 계정 정보가 없습니다.")
                     return
-                profile = self.get_sender_profile(key)
+                profile = self.get_login_user_profile()
                 if not (sender_name or "").strip():
                     sender_name = (profile.get("user_name") or "").strip() or (self.user_name or "").strip()
                 sample_row = {"업체명": "테스트", "이메일": to_email}

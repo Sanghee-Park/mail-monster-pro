@@ -1,6 +1,6 @@
 import customtkinter as ctk
 from tkinter import ttk, filedialog, messagebox, simpledialog
-import json, os, sys, random, sqlite3, re, base64
+import gc, json, os, sys, random, sqlite3, re, base64
 import smtplib, threading, time, mimetypes
 import tempfile, webbrowser
 from datetime import datetime
@@ -37,6 +37,10 @@ if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+# Phase 4: 계정별 로그 박스 무한 누적 방지 (발송 로직과 무관)
+LOG_CONSOLE_MAX_LINES = 1000
 
 
 def _dedup_template_key(template_name, title_fallback=""):
@@ -87,7 +91,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.6.5"
+            CURRENT_VERSION = "v2.6.6"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686") # 💡 30% 축소 사이즈 적용
         ctk.set_appearance_mode("dark")
@@ -553,7 +557,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.6.5"
+            _ver = "v2.6.6"
         ctk.CTkLabel(header, text=f"🚀 MAIL MONSTER PRO {_ver}", font=("맑은 고딕", 18, "bold"), text_color=theme_color).pack(side="left", padx=20, pady=5)
         
         # 중앙: 통계 라벨
@@ -935,6 +939,8 @@ class ModernMailSender(ctk.CTk):
             
             update_count_label()
             self.save_recipients_rows(task_key, rows, headers)
+            del df
+            gc.collect()
 
         def clear_excel():
             for item in tree.get_children():
@@ -1372,8 +1378,8 @@ class ModernMailSender(ctk.CTk):
             # v2.6.5: 같은 사용자+같은 이메일+같은 템플릿만 스킵.
             actual_template = _dedup_template_key(template_name, title)
 
-            # --- Task 1-1 Pre-Compose: 서버 접속 전에 모든 MIME 조립 ---
-            pre_composed = []
+            # Phase 4: MIME 1건씩 조립→즉시 발송 (pre_composed 누적 제거). 스킵/간격은 기존과 동일.
+            need_wait_before_send = False
             for idx, row_data in enumerate(all_rows, 1):
                 if self.stop_flags[key]:
                     break
@@ -1382,7 +1388,7 @@ class ModernMailSender(ctk.CTk):
                 no = idx
                 try:
                     if prevent_dup:
-                        dup, dup_reason, prior_sender = self.check_duplicate_send_status(
+                        dup, dup_reason, _ = self.check_duplicate_send_status(
                             email, actual_template
                         )
                         if dup and dup_reason == "same_template_same_sender":
@@ -1397,15 +1403,19 @@ class ModernMailSender(ctk.CTk):
                         continue
                     final_title, final_body = self._render_message_with_variables(key, title, body, row_data)
                     msg = self._build_single_mime(config, s_name, email, final_title, final_body, data, comp)
-                    pre_composed.append((msg, idx, comp, email, final_title, no))
                 except Exception as e:
                     self.write_log(p, i, f"❌ [{idx}/{len(all_rows)}] {comp} <{email}> MIME 조립 오류: {e}")
+                    continue
 
-            # --- Task 1-2 Just-In-Time: 조립된 메일별로 접속 → 발송 → 종료 ---
-            total = len(pre_composed)
-            for pos, (msg, idx, comp, email, final_title, no) in enumerate(pre_composed):
-                if self.stop_flags[key]:
-                    break
+                if need_wait_before_send:
+                    wait_sec = self.get_wait_seconds(interval)
+                    for _ in range(wait_sec):
+                        if self.stop_flags[key]:
+                            break
+                        time.sleep(1)
+                    if self.stop_flags[key]:
+                        break
+
                 try:
                     success, msg_text = self._send_with_retry(config, msg, max_retries=3)
                     if success:
@@ -1423,18 +1433,26 @@ class ModernMailSender(ctk.CTk):
                         self.write_log(p, i, f"❌ [{idx}/{len(all_rows)}] {comp} <{email}> 재시도 실패: {self._translate_smtp_error(msg_text)}")
                 except Exception as e:
                     self.write_log(p, i, f"❌ [{idx}/{len(all_rows)}] {comp} <{email}> 발송 오류: {self._translate_smtp_error(str(e))}")
-                if pos < total - 1:
-                    wait_sec = self.get_wait_seconds(interval)
-                    for _ in range(wait_sec):
-                        if self.stop_flags[key]:
-                            break
-                        time.sleep(1)
+                need_wait_before_send = True
             self.write_log(p, i, "🏁 모든 작업 종료")
         finally: self.reset_btns(s_b, st_b)
 
     def write_log(self, p, i, m):
-        key = f"{p}_{i}"; box = self.log_consoles[key]; box.configure(state="normal")
-        box.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {m}\n"); box.see("end"); box.configure(state="disabled")
+        key = f"{p}_{i}"
+        box = self.log_consoles[key]
+        box.configure(state="normal")
+        box.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {m}\n")
+        try:
+            while True:
+                end_idx = box.index("end-1c")
+                line_no = int(float(end_idx.split(".")[0]))
+                if line_no <= LOG_CONSOLE_MAX_LINES:
+                    break
+                box.delete("1.0", "2.0")
+        except Exception:
+            pass
+        box.see("end")
+        box.configure(state="disabled")
 
     def set_stop(self, k): self.stop_flags[k] = True
     def reset_btns(self, s, st): self.after(0, lambda: (s.configure(state="normal"), st.configure(state="disabled", fg_color="#555")))
@@ -1559,7 +1577,7 @@ class ModernMailSender(ctk.CTk):
         return new_html, embedded
 
     def _build_single_mime(self, config, s_name, to_email, final_title, final_body, data, comp):
-        """Task 1-1: 서버 접속 없이 MIME 메시지 1통만 조립. (Pre-Compose)"""
+        """서버 접속 없이 MIME 메시지 1통 조립. `real_engine`에서 1건씩 조립 후 즉시 발송."""
         msg = MIMEMultipart()
         msg['From'] = formataddr((str(Header(s_name or "운영사무국", 'utf-8')), config['id']))
         msg['To'] = to_email

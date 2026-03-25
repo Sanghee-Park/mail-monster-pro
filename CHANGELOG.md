@@ -1,5 +1,14 @@
 # MAIL MONSTER PRO 변경 이력
 
+## [v2.6.6] - 2026-03-25
+
+### 메모리 최적화 (발송·중복 차단 동작 동일)
+- **중복 차단**: v2.6.5 정책 유지 — `check_duplicate_send_status` / `same_template_same_sender` 로직 변경 없음.
+- **대량 발송 RAM 절감**: `real_engine`에서 `pre_composed` MIME 누적 제거, 수신처 1건씩 `조립 → 즉시 발송`(스킵·발송 간격·재시도·성공 기록 동일).
+- **로그 누적 제한**: `write_log`에서 계정별 로그 박스 최대 1000줄(오래된 줄부터 삭제).
+- **엑셀 로드 후 정리**: 수신처 엑셀/CSV 로드 후 `DataFrame` 해제 및 `gc.collect()`.
+- **버전 정렬**: `login.py` / `main_ui.py` 폴백 / Inno `MyAppVersion` → `v2.6.6` / `2.6.6`.
+
 ## [v2.6.5] - 2026-03-20
 
 ### 중복 차단 정책 재정의

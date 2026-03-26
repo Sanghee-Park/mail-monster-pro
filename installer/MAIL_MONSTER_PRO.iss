@@ -3,7 +3,7 @@
 ; 컴파일: ISCC.exe MAIL_MONSTER_PRO.iss (또는 Inno Setup Compiler에서 열기)
 
 #define MyAppName "MAIL MONSTER PRO"
-#define MyAppVersion "2.6.6"
+#define MyAppVersion "2.6.7"
 #define MyAppPublisher "MAIL MONSTER"
 #define MyAppExeName "MAIL_MONSTER_PRO.exe"
 

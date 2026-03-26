@@ -91,7 +91,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.6.6"
+            CURRENT_VERSION = "v2.6.7"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686") # 💡 30% 축소 사이즈 적용
         ctk.set_appearance_mode("dark")
@@ -557,7 +557,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.6.6"
+            _ver = "v2.6.7"
         ctk.CTkLabel(header, text=f"🚀 MAIL MONSTER PRO {_ver}", font=("맑은 고딕", 18, "bold"), text_color=theme_color).pack(side="left", padx=20, pady=5)
         
         # 중앙: 통계 라벨
@@ -906,8 +906,8 @@ class ModernMailSender(ctk.CTk):
                 count_lbl.configure(text=f"총 {n}건 등록 (1 ~ {n}행)")
 
         def load_excel():
-            path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx *.xls *.csv")])
-            if not path:
+            paths = filedialog.askopenfilenames(filetypes=[("Excel Files", "*.xlsx *.xls *.csv")])
+            if not paths:
                 return
 
             try:
@@ -916,31 +916,55 @@ class ModernMailSender(ctk.CTk):
                 messagebox.showerror("패키지 없음", "pandas가 설치되어 있지 않아 엑셀 파일을 불러올 수 없습니다.\n\npip install pandas")
                 return
 
-            try:
-                df = pd.read_csv(path) if path.endswith('.csv') else pd.read_excel(path)
-            except Exception as e:
-                messagebox.showerror("불러오기 실패", f"엑셀 파일을 읽는 중 오류가 발생했습니다:\n{e}")
+            state = self.load_recipients_state(task_key)
+            existing_rows = list(state.get("rows", []))
+            merged_headers = list(state.get("headers", []))
+            new_rows = []
+            start = len(tree.get_children()) + 1
+            loaded_files = 0
+            failed_files = []
+
+            for path in paths:
+                try:
+                    lower = path.lower()
+                    df = pd.read_csv(path) if lower.endswith(".csv") else pd.read_excel(path)
+                except Exception as e:
+                    failed_files.append(f"{os.path.basename(path)}: {e}")
+                    continue
+
+                loaded_files += 1
+                for col in list(df.columns):
+                    if col not in merged_headers:
+                        merged_headers.append(col)
+
+                for i, (_, r) in enumerate(df.iterrows(), start=start):
+                    comp = r.get('업체명', '') if '업체명' in r else (str(r.iloc[0]) if len(r) > 0 else '')
+                    email = r.get('이메일', '') if '이메일' in r else (str(r.iloc[1]) if len(r) > 1 else '')
+                    tree.insert("", "end", values=(i, comp, email))
+
+                    row_data = {}
+                    for col in df.columns:
+                        val = r.get(col, '')
+                        row_data[col] = str(val) if val is not None and str(val).strip() else ''
+                    new_rows.append(row_data)
+                start += len(df.index)
+                del df
+                gc.collect()
+
+            if loaded_files == 0:
+                detail = "\n".join(failed_files[:5])
+                messagebox.showerror("불러오기 실패", f"선택한 파일을 읽지 못했습니다.\n{detail}")
                 return
 
-            headers = list(df.columns)
-            start = len(tree.get_children()) + 1
-            rows = []
-            for i, (_, r) in enumerate(df.iterrows(), start=start):
-                comp = r.get('업체명', '') if '업체명' in r else (str(r.iloc[0]) if len(r) > 0 else '')
-                email = r.get('이메일', '') if '이메일' in r else (str(r.iloc[1]) if len(r) > 1 else '')
-                tree.insert("", "end", values=(i, comp, email))
-                
-                # 모든 엑셀 데이터 저장 (동적 변수용)
-                row_data = {}
-                for col in df.columns:
-                    val = r.get(col, '')
-                    row_data[col] = str(val) if val is not None and str(val).strip() else ''
-                rows.append(row_data)
-            
+            combined_rows = existing_rows + new_rows
             update_count_label()
-            self.save_recipients_rows(task_key, rows, headers)
-            del df
-            gc.collect()
+            self.save_recipients_rows(task_key, combined_rows, merged_headers)
+            if failed_files:
+                detail = "\n".join(failed_files[:5])
+                messagebox.showwarning(
+                    "일부 파일 실패",
+                    f"{loaded_files}개 파일은 추가되었고, {len(failed_files)}개 파일은 실패했습니다.\n{detail}",
+                )
 
         def clear_excel():
             for item in tree.get_children():

@@ -1,4 +1,4 @@
-# MAIL MONSTER PRO 계획 (v2.6.5 중복 정책 · v2.6.6 메모리 최적화 릴리스)
+# MAIL MONSTER PRO 계획 (v2.6.5 중복 정책 · v2.6.7 운영 안정화 릴리스)
 
 ## 요구사항(확정)
 - **스킵 조건**: 같은 프로그램 사용자(로그인 사용자) + 같은 수신 이메일 + 같은 템플릿일 때만 스킵.
@@ -66,6 +66,22 @@
 - **Task 4-3 (엑셀 로드 메모리 정리)** ✅ `main_ui.py` `load_excel` 내부
   - `save_recipients_rows` 후 `del df`, `gc.collect()`
   - **불변**: 저장 `rows`/Tree 표시 동일
+
+---
+
+## Phase 5: 수신처 다중 엑셀 누적 버그 (v2.6.7) — 반영 완료
+목표: 수신처에서 여러 엑셀/CSV를 추가해도 `recipients.json`과 발송 대상이 1:1로 일치하도록 보장한다.
+
+- **Task 5-1 (다중 파일 선택)** ✅ `main_ui.py` `load_excel`
+  - 파일 선택을 `askopenfilename` → `askopenfilenames`로 변경
+- **Task 5-2 (누적 저장 로직 수정)** ✅
+  - 기존 상태(`existing_rows`)를 읽은 뒤 신규 로드(`new_rows`)를 합쳐 `combined_rows` 저장
+  - 헤더는 파일 간 병합(`merged_headers`)
+- **Task 5-3 (부분 실패 허용/안내)** ✅
+  - 일부 파일 로드 실패 시에도 성공 파일은 반영하고, 실패 목록은 경고 팝업으로 안내
+- **Task 5-4 (검증 결과)** ✅
+  - 코드 경로 검증: 발송 엔진은 `load_recipients_state(...).rows`를 사용
+  - 누적 저장 전환으로 “마지막 파일만 발송” 원인 제거 확인
 
 ---
 

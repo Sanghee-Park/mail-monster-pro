@@ -45,5 +45,5 @@ Write-Host "=== 패키징 완료 ===" -ForegroundColor Green
 Write-Host "  - $exe"
 Write-Host "  - $shaPath"
 Write-Host ""
-Write-Host "GitHub 배포: git tag v2.6.6 && git push origin v2.6.6  (버전은 login.py CURRENT_VERSION 과 일치)" -ForegroundColor Gray
+Write-Host "GitHub 배포: git tag v2.6.7 && git push origin v2.6.7  (버전은 login.py CURRENT_VERSION 과 일치)" -ForegroundColor Gray
 Write-Host "자세한 절차: RELEASE.md" -ForegroundColor Gray

@@ -2,8 +2,13 @@
 from login import LoginApp
 from main_ui import ModernMailSender
 
-def launch_main_app(user_name, grade, remaining):
-    app = ModernMailSender(user_name=user_name, grade=grade, remaining=remaining)
+def launch_main_app(user_name, grade, remaining, login_user_id=""):
+    app = ModernMailSender(
+        user_name=user_name,
+        grade=grade,
+        remaining=remaining,
+        login_user_id=login_user_id,
+    )
     app.mainloop()
 
 if __name__ == "__main__":

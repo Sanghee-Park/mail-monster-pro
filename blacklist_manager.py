@@ -12,21 +12,29 @@ class BlacklistManager(ctk.CTkToplevel):
         self.main_ui = main_ui
         self.title("블랙리스트 관리")
         self.geometry("600x500")
+        self.minsize(420, 360)
         self.resizable(True, True)
-        
-        # 상단: 추가/제거 버튼
+        try:
+            self.transient(parent)
+        except Exception:
+            pass
+
+        # 상단: 필드(세로로 쌓여 좁은 창에서도 잘리지 않음)
         top_frame = ctk.CTkFrame(self)
         top_frame.pack(fill="x", padx=10, pady=10)
-        
-        ctk.CTkLabel(top_frame, text="새 이메일:").pack(side="left", padx=5)
-        self.email_entry = ctk.CTkEntry(top_frame, width=250)
-        self.email_entry.pack(side="left", padx=5)
-        
-        ctk.CTkLabel(top_frame, text="사유:").pack(side="left", padx=5)
-        self.reason_entry = ctk.CTkEntry(top_frame, width=150)
-        self.reason_entry.pack(side="left", padx=5)
-        
-        ctk.CTkButton(top_frame, text="추가", command=self._add_to_blacklist, width=80).pack(side="left", padx=5)
+
+        row1 = ctk.CTkFrame(top_frame, fg_color="transparent")
+        row1.pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(row1, text="새 이메일:").pack(side="left", padx=(0, 8))
+        self.email_entry = ctk.CTkEntry(row1, placeholder_text="email@example.com", height=32)
+        self.email_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        row2 = ctk.CTkFrame(top_frame, fg_color="transparent")
+        row2.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(row2, text="사유:").pack(side="left", padx=(0, 8))
+        self.reason_entry = ctk.CTkEntry(row2, height=32)
+        self.reason_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ctk.CTkButton(row2, text="추가", command=self._add_to_blacklist, width=80, height=32).pack(side="right")
         
         # 중간: 테이블 (트리뷰)
         mid_frame = ctk.CTkFrame(self)
@@ -34,40 +42,76 @@ class BlacklistManager(ctk.CTkToplevel):
         
         # 스크롤바와 함께 테이블 
         from tkinter import ttk
-        
-        # 스크롤바
+
+        _tv_style = ttk.Style()
+
         scrollbar = ttk.Scrollbar(mid_frame)
-        scrollbar.pack(side="right", fill="y")
-        
-        # 트리뷰
         self.tree = ttk.Treeview(
             mid_frame,
             columns=("email", "reason", "added_at"),
-            height=15,
-            yscrollcommand=scrollbar.set
+            height=12,
+            yscrollcommand=scrollbar.set,
         )
         scrollbar.config(command=self.tree.yview)
         
-        self.tree.column("#0", width=0, stretch="no")
-        self.tree.column("email", anchor="w", width=250)
-        self.tree.column("reason", anchor="w", width=200)
-        self.tree.column("added_at", anchor="w", width=120)
+        self.tree.column("#0", width=0, stretch=False)
+        self.tree.column("email", anchor="w", width=220, stretch=True, minwidth=100)
+        self.tree.column("reason", anchor="w", width=160, stretch=True, minwidth=80)
+        self.tree.column("added_at", anchor="w", width=110, stretch=False, minwidth=90)
         
         self.tree.heading("#0", text="", anchor="w")
         self.tree.heading("email", text="이메일", anchor="w")
         self.tree.heading("reason", text="사유", anchor="w")
         self.tree.heading("added_at", text="추가 날짜", anchor="w")
         
-        self.tree.pack(fill="both", expand=True)
-        
-        # 하단: 선택된 항목 삭제 버튼
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        _rz_state = {"aid": None}
+
+        def _apply_blacklist_tree_size():
+            _rz_state["aid"] = None
+            w = max(mid_frame.winfo_width() - 24, 200)
+            em = max(100, int(w * 0.42))
+            rs = max(80, int(w * 0.32))
+            at = max(90, w - em - rs - 40)
+            try:
+                self.tree.column("email", width=em)
+                self.tree.column("reason", width=rs)
+                self.tree.column("added_at", width=at)
+            except Exception:
+                pass
+            try:
+                h = max(mid_frame.winfo_height() - 24, 80)
+                rh = int(float(_tv_style.lookup("Treeview", "rowheight") or 24))
+                rh = max(rh, 18)
+                rows = max(6, min(60, h // rh))
+                self.tree.configure(height=rows)
+            except Exception:
+                pass
+
+        def _resize_blacklist_tree(event):
+            if event.widget is not mid_frame:
+                return
+            if _rz_state["aid"] is not None:
+                try:
+                    mid_frame.after_cancel(_rz_state["aid"])
+                except Exception:
+                    pass
+            _rz_state["aid"] = mid_frame.after(80, _apply_blacklist_tree_size)
+
+        mid_frame.bind("<Configure>", _resize_blacklist_tree, add="+")
+        self.after(150, _apply_blacklist_tree_size)
+
+        # 하단: 버튼(한 줄에 너무 많으면 줄바꿈 느낌으로 2행)
         bottom_frame = ctk.CTkFrame(self)
         bottom_frame.pack(fill="x", padx=10, pady=10)
-        
-        ctk.CTkButton(bottom_frame, text="선택된 항목 제거", command=self._remove_from_blacklist, width=150).pack(side="left", padx=5)
-        ctk.CTkButton(bottom_frame, text="새로고침", command=self._refresh_table, width=150).pack(side="left", padx=5)
-        ctk.CTkButton(bottom_frame, text="전체 제거", command=self._clear_all, width=150).pack(side="left", padx=5)
-        ctk.CTkButton(bottom_frame, text="닫기", command=self.destroy, width=150).pack(side="right", padx=5)
+        bf1 = ctk.CTkFrame(bottom_frame, fg_color="transparent")
+        bf1.pack(fill="x")
+        ctk.CTkButton(bf1, text="선택된 항목 제거", command=self._remove_from_blacklist).pack(side="left", padx=4, pady=2)
+        ctk.CTkButton(bf1, text="새로고침", command=self._refresh_table).pack(side="left", padx=4, pady=2)
+        ctk.CTkButton(bf1, text="전체 제거", command=self._clear_all).pack(side="left", padx=4, pady=2)
+        ctk.CTkButton(bf1, text="닫기", command=self.destroy).pack(side="right", padx=4, pady=2)
         
         # 초기 로드
         self._refresh_table()

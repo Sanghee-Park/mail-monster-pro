@@ -99,9 +99,10 @@ def _parse_sender_profile_from_entry(entry):
 
 
 class ModernMailSender(ctk.CTk):
-    def __init__(self, user_name="사용자", grade="무료권", remaining="0"):
+    def __init__(self, user_name="사용자", grade="무료권", remaining="0", login_user_id=""):
         super().__init__()
         self.user_name, self.grade, self.remaining = user_name, grade, remaining
+        self.login_user_id = (login_user_id or "").strip()
         self.config_file = os.path.join(BASE_DIR, "config.json")
         self.user_profiles_file = os.path.join(BASE_DIR, "user_profiles.json")
         self.template_file = os.path.join(BASE_DIR, "templates.json")
@@ -114,9 +115,10 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.6.8"
+            CURRENT_VERSION = "v2.7.0"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
-        self.geometry("980x686") # 💡 30% 축소 사이즈 적용
+        self.geometry("980x686")  # 기본 크기
+        self.minsize(800, 520)  # 축소 시 레이아웃 붕괴·버튼 소실 방지
         ctk.set_appearance_mode("dark")
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         
@@ -128,8 +130,9 @@ class ModernMailSender(ctk.CTk):
         self._migrate_legacy_sender_profile_once()
         self.init_db()
         self.setup_ui()
-        # Phase 3 Task 3-1: 구글 시트 '발송내역' → 로컬 DB 동기화 (비동기)
-        threading.Thread(target=self._run_startup_sent_log_sync, daemon=True).start()
+        # Phase 3 Task 3-1: (옵션) 구글 시트 '발송내역' → 로컬 DB 동기화 — 기본은 끔(로컬 DB만)
+        if self._sheet_sent_log_enabled():
+            threading.Thread(target=self._run_startup_sent_log_sync, daemon=True).start()
 
     def init_db(self):
         con = sqlite3.connect(self.db_path)
@@ -159,9 +162,15 @@ class ModernMailSender(ctk.CTk):
             # Phase 3 Task 3-1: 발송담당자 (구글 시트·2중 필터용)
             if "sender" not in cols:
                 con.execute("ALTER TABLE sent_log ADD COLUMN sender TEXT")
+            cols = [c[1] for c in con.execute("PRAGMA table_info(sent_log)").fetchall()]
+            if "account_id" not in cols:
+                con.execute("ALTER TABLE sent_log ADD COLUMN account_id TEXT")
 
             con.execute("CREATE INDEX IF NOT EXISTS idx_sent_task_email ON sent_log(task_key, email)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_sent_email_template ON sent_log(email, template_name)")
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sent_account_email_tmpl ON sent_log(account_id, email, template_name)"
+            )
 
             # 블랙리스트 테이블 (Task 5-1)
             con.execute(
@@ -253,10 +262,11 @@ class ModernMailSender(ctk.CTk):
             return
         tpl = self._effective_template_for_log(template_name, subject)
         sender = (self.user_name or "").strip()
+        acc = (self.login_user_id or "").strip()
         con = sqlite3.connect(self.db_path)
         try:
             con.execute(
-                "INSERT INTO sent_log(task_key, provider, account_idx, comp, email, subject, template_name, sent_at, sender) VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO sent_log(task_key, provider, account_idx, comp, email, subject, template_name, sent_at, sender, account_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     task_key,
                     provider,
@@ -267,6 +277,7 @@ class ModernMailSender(ctk.CTk):
                     tpl,
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     sender,
+                    acc or None,
                 ),
             )
             con.commit()
@@ -274,21 +285,22 @@ class ModernMailSender(ctk.CTk):
             con.close()
 
     def check_duplicate_send_status(self, email, template_name=""):
-        """v2.6.5: 같은 사용자+같은 이메일+같은 템플릿만 스킵.
+        """같은 로그인 계정(아이디)+같은 이메일+같은 템플릿이면 스킵. account_id가 없는 과거 행은 표시명(sender)으로만 매칭(하위 호환).
         반환: (스킵 여부, 사유, 이전_발송자_표시명)
-        - 타 사용자 이력은 스킵 사유가 아님(발송 허용).
+        - 타 계정 이력은 스킵 사유가 아님(발송 허용).
         """
         e = (email or "").strip()
         if not e:
             return False, None, None
         tpl_key = (template_name or "").strip().lower()
-        me = (self.user_name or "").strip().lower()
-        if not me:
+        me_id = (self.login_user_id or "").strip().lower()
+        me_name = (self.user_name or "").strip().lower()
+        if not me_id and not me_name:
             return False, None, None
         con = sqlite3.connect(self.db_path)
         try:
             cur = con.execute(
-                "SELECT sender, template_name FROM sent_log WHERE email=? COLLATE NOCASE",
+                "SELECT sender, template_name, account_id FROM sent_log WHERE email=? COLLATE NOCASE",
                 (e,),
             )
             rows = cur.fetchall()
@@ -296,14 +308,23 @@ class ModernMailSender(ctk.CTk):
             con.close()
         if not rows:
             return False, None, None
-        for sender, tmpl_db in rows:
-            s = (sender or "").strip().lower()
-            if not s or s != me:
-                continue
+        for sender, tmpl_db, acc_db in rows:
             t = (tmpl_db or "").strip().lower()
-            if t == tpl_key:
-                prior = (sender or "").strip() or "(미기록)"
-                return True, "same_template_same_sender", prior
+            if t != tpl_key:
+                continue
+            a = (acc_db or "").strip().lower()
+            if me_id:
+                if a and a == me_id:
+                    prior = (sender or "").strip() or "(미기록)"
+                    return True, "same_template_same_sender", prior
+                if not a and me_name and (sender or "").strip().lower() == me_name:
+                    prior = (sender or "").strip() or "(미기록)"
+                    return True, "same_template_same_sender", prior
+            else:
+                s = (sender or "").strip().lower()
+                if s and s == me_name:
+                    prior = (sender or "").strip() or "(미기록)"
+                    return True, "same_template_same_sender", prior
         return False, None, None
 
     def _profile_key_for_login_user(self):
@@ -364,6 +385,22 @@ class ModernMailSender(ctk.CTk):
                 self.save_login_user_profile(sp)
                 return
 
+    def _sheet_sent_log_enabled(self):
+        """공유 시트 '발송내역'에 append·기동 시 시트→DB 동기화. 기본 False(로컬 sent_history.db만, 메모리·시트 부담 최소).
+        켜기: BASE_DIR/sheet_sent_log_enabled.txt 첫 줄이 1/true/yes/on/y 또는 환경변수 MAILMONSTER_ENABLE_SHEET_SENT_LOG=1
+        """
+        p = os.path.join(BASE_DIR, "sheet_sent_log_enabled.txt")
+        if os.path.isfile(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    line = (f.readline() or "").strip().lower()
+                if line in ("1", "true", "yes", "on", "y"):
+                    return True
+            except OSError:
+                pass
+        env = os.environ.get("MAILMONSTER_ENABLE_SHEET_SENT_LOG", "").strip().lower()
+        return env in ("1", "true", "yes", "on", "y")
+
     def _ensure_sent_log_worksheet(self, spreadsheet):
         """Phase 3: 워크시트 '발송내역'이 없으면 헤더와 함께 생성."""
         if gspread is None:
@@ -371,12 +408,14 @@ class ModernMailSender(ctk.CTk):
         try:
             return spreadsheet.worksheet("발송내역")
         except gspread.WorksheetNotFound:
-            ws = spreadsheet.add_worksheet(title="발송내역", rows=3000, cols=5)
-            ws.append_row(["보낸 날짜", "발송담당자", "업체명", "이메일", "템플릿명"])
+            ws = spreadsheet.add_worksheet(title="발송내역", rows=3000, cols=6)
+            ws.append_row(["보낸 날짜", "발송담당자", "업체명", "이메일", "템플릿명", "로그인ID"])
             return ws
 
     def _sync_sent_log_from_sheet(self):
         """Task 3-1: 구글 시트 '발송내역' 전체를 읽어 로컬 sent_log에 없는 행만 삽입."""
+        if not self._sheet_sent_log_enabled():
+            return 0
         if gspread is None:
             return 0
         cred_path = os.path.join(BASE_DIR, "credentials.json")
@@ -404,20 +443,22 @@ class ModernMailSender(ctk.CTk):
                 comp = (row[2] or "").strip()
                 email = (row[3] or "").strip()
                 tmpl = (row[4] or "").strip()
+                acc_sheet = (row[5] or "").strip() if len(row) > 5 else ""
                 if not email or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
                     continue
                 if not sent_at:
                     sent_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 cur = con.execute(
                     """SELECT 1 FROM sent_log WHERE email=? COLLATE NOCASE AND sent_at=?
-                       AND TRIM(COALESCE(sender,''))=? AND LOWER(TRIM(COALESCE(template_name,'')))=LOWER(?) LIMIT 1""",
-                    (email, sent_at, sender, tmpl),
+                       AND TRIM(COALESCE(sender,''))=? AND LOWER(TRIM(COALESCE(template_name,'')))=LOWER(?)
+                       AND LOWER(TRIM(COALESCE(account_id,'')))=LOWER(?) LIMIT 1""",
+                    (email, sent_at, sender, tmpl, acc_sheet),
                 )
                 if cur.fetchone():
                     continue
                 con.execute(
-                    """INSERT INTO sent_log(task_key, provider, account_idx, comp, email, subject, template_name, sent_at, sender)
-                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO sent_log(task_key, provider, account_idx, comp, email, subject, template_name, sent_at, sender, account_id)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
                     (
                         "cloud_sync",
                         "sheet",
@@ -428,6 +469,7 @@ class ModernMailSender(ctk.CTk):
                         tmpl,
                         sent_at,
                         sender,
+                        acc_sheet or None,
                     ),
                 )
                 inserted += 1
@@ -438,6 +480,8 @@ class ModernMailSender(ctk.CTk):
 
     def _append_cloud_sent_row(self, comp, email, template_name):
         """Task 3-3: 발송 성공 시 구글 시트 '발송내역'에 한 줄 추가."""
+        if not self._sheet_sent_log_enabled():
+            return
         if gspread is None:
             return
         cred_path = os.path.join(BASE_DIR, "credentials.json")
@@ -457,6 +501,7 @@ class ModernMailSender(ctk.CTk):
                     comp or "",
                     (email or "").strip(),
                     (template_name or "").strip(),
+                    (self.login_user_id or "").strip(),
                 ],
                 value_input_option="USER_ENTERED",
             )
@@ -569,38 +614,90 @@ class ModernMailSender(ctk.CTk):
             total = self._get_total_sent_count()
             self.after(0, lambda: self.stats_label.configure(text=f"📊 오늘 발송: {today}건 | 누적 발송: {total}건"))
 
+    def _bind_recipients_tree_autosize(self, tree_wrap, tree):
+        """수신처 Treeview: 영역 높이에 맞춰 보이는 행 수·열 너비 조정 (창 크기 변경 대응)."""
+        style = ttk.Style()
+        state = {"aid": None}
+
+        def apply_size():
+            try:
+                w = max(tree_wrap.winfo_width(), 80)
+                h = max(tree_wrap.winfo_height(), 40)
+            except Exception:
+                return
+            try:
+                rh = int(float(style.lookup("Treeview", "rowheight") or 24))
+            except Exception:
+                rh = 24
+            rh = max(rh, 18)
+            rows = max(5, min(80, (h - 28) // rh))
+            try:
+                tree.configure(height=rows)
+            except Exception:
+                pass
+            pad = 24
+            inner = max(w - pad, 120)
+            no_w = max(40, min(56, int(inner * 0.08)))
+            comp_w = max(72, int(inner * 0.38))
+            em_w = max(96, inner - no_w - comp_w)
+            try:
+                tree.column("no", width=no_w, stretch=False, minwidth=36)
+                tree.column("comp", width=comp_w, stretch=True, minwidth=60)
+                tree.column("email", width=em_w, stretch=True, minwidth=80)
+            except Exception:
+                pass
+
+        def on_configure(event):
+            if event.widget is not tree_wrap:
+                return
+            if state["aid"] is not None:
+                try:
+                    tree_wrap.after_cancel(state["aid"])
+                except Exception:
+                    pass
+            state["aid"] = tree_wrap.after(60, _debounced)
+
+        def _debounced():
+            state["aid"] = None
+            apply_size()
+
+        tree_wrap.bind("<Configure>", on_configure, add="+")
+        self.after(200, apply_size)
+
     def setup_ui(self):
         self._font_title = ("맑은 고딕", 14, "bold")
         self._font_body = ("맑은 고딕", 12)
         self._font_small = ("맑은 고딕", 11)
         theme_color = "#8e44ad" if "관리자" in self.grade else ("#27ae60" if self.grade == "무료권" else "#2980b9")
-        header = ctk.CTkFrame(self, height=60, fg_color="#1a1a1a", corner_radius=0); header.pack(fill="x", side="top")
-        
-        # 좌측: 로고
+        header = ctk.CTkFrame(self, fg_color="#1a1a1a", corner_radius=0)
+        header.pack(fill="x", side="top")
+        header.grid_columnconfigure(1, weight=1)
+
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.6.8"
-        ctk.CTkLabel(header, text=f"🚀 MAIL MONSTER PRO {_ver}", font=("맑은 고딕", 18, "bold"), text_color=theme_color).pack(side="left", padx=20, pady=5)
-        
-        # 중앙: 통계 라벨
-        self.stats_label = ctk.CTkLabel(header, text="📊 오늘 발송: 0건 | 누적 발송: 0건", font=self._font_small, text_color="#e74c3c")
-        self.stats_label.pack(side="left", padx=20)
-        self._update_stats_label()
-        
-        # 우측: 사용자 이름
-        ctk.CTkLabel(header, text=f"✨ {self.user_name} 님", font=self._font_body).pack(side="right", padx=20, pady=5)
-        ctk.CTkButton(
+            _ver = "v2.7.0"
+
+        title_lbl = ctk.CTkLabel(
             header,
-            text="👤 내 프로필",
-            width=110,
-            height=35,
+            text=f"🚀 MAIL MONSTER PRO {_ver}",
+            font=("맑은 고딕", 18, "bold"),
+            text_color=theme_color,
+        )
+        title_lbl.grid(row=0, column=0, padx=(16, 8), pady=(10, 4), sticky="w")
+
+        self.stats_label = ctk.CTkLabel(
+            header,
+            text="📊 오늘 발송: 0건 | 누적 발송: 0건",
             font=self._font_small,
-            fg_color="#8e44ad",
-            command=self._open_user_profile_popup,
-        ).pack(side="right", padx=5, pady=5)
-        
-        # 우측: Phase 5 Task 5-2 차단 목록 최신화 + 블랙리스트 관리
+            text_color="#e74c3c",
+        )
+        self.stats_label.grid(row=0, column=1, padx=8, pady=(10, 4), sticky="ew")
+        self._update_stats_label()
+
+        user_lbl = ctk.CTkLabel(header, text=f"✨ {self.user_name} 님", font=self._font_body)
+        user_lbl.grid(row=0, column=2, padx=(8, 16), pady=(10, 4), sticky="e")
+
         def _run_sync_blacklist():
             def worker():
                 ok, result = self._sync_blacklist_from_sheet()
@@ -608,9 +705,40 @@ class ModernMailSender(ctk.CTk):
                     self.after(0, lambda: messagebox.showinfo("동기화 완료", f"{result}건의 차단 목록이 동기화되었습니다."))
                 else:
                     self.after(0, lambda: messagebox.showerror("동기화 실패", str(result)))
+
             threading.Thread(target=worker, daemon=True).start()
-        ctk.CTkButton(header, text="🔄 차단 목록 최신화", width=140, height=35, font=self._font_small, fg_color="#2980b9", command=_run_sync_blacklist).pack(side="right", padx=5, pady=5)
-        ctk.CTkButton(header, text="⚙️ 블랙리스트", width=120, height=35, font=self._font_small, command=self._open_blacklist_manager).pack(side="right", padx=5, pady=5)
+
+        action_bar = ctk.CTkFrame(header, fg_color="transparent")
+        action_bar.grid(row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=(2, 10))
+        action_bar.grid_columnconfigure(0, weight=1)
+        inner = ctk.CTkFrame(action_bar, fg_color="transparent")
+        inner.grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(
+            inner,
+            text="⚙️ 블랙리스트",
+            width=118,
+            height=32,
+            font=self._font_small,
+            command=self._open_blacklist_manager,
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            inner,
+            text="🔄 차단 목록 최신화",
+            width=138,
+            height=32,
+            font=self._font_small,
+            fg_color="#2980b9",
+            command=_run_sync_blacklist,
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            inner,
+            text="👤 내 프로필",
+            width=104,
+            height=32,
+            font=self._font_small,
+            fg_color="#8e44ad",
+            command=self._open_user_profile_popup,
+        ).pack(side="left", padx=(0, 6))
         
         # 테이블 공통 스타일 (가독성)
         style = ttk.Style()
@@ -774,16 +902,21 @@ class ModernMailSender(ctk.CTk):
         pop = ctk.CTkToplevel(self)
         pop.title("내 프로필")
         pop.geometry("430x420")
+        pop.minsize(320, 380)
         pop.attributes("-topmost", True)
+        try:
+            pop.transient(self)
+        except Exception:
+            pass
 
         profile = self.get_login_user_profile()
         ctk.CTkLabel(pop, text=f"로그인 사용자: {self.user_name}", font=self._font_small, text_color="#95a5a6").pack(anchor="w", padx=16, pady=(14, 8))
         ctk.CTkLabel(pop, text="발송자 정보", font=self._font_title).pack(anchor="w", padx=16, pady=(0, 8))
-        _e = {"width": 360, "height": 36, "font": self._font_body}
-        e_name = ctk.CTkEntry(pop, placeholder_text="이름 (user_name)", **_e); e_name.pack(pady=5)
-        e_rank = ctk.CTkEntry(pop, placeholder_text="직책 (user_rank)", **_e); e_rank.pack(pady=5)
-        e_phone = ctk.CTkEntry(pop, placeholder_text="전화번호 (user_phone)", **_e); e_phone.pack(pady=5)
-        e_email = ctk.CTkEntry(pop, placeholder_text="이메일 (user_email)", **_e); e_email.pack(pady=5)
+        _e = {"height": 36, "font": self._font_body}
+        e_name = ctk.CTkEntry(pop, placeholder_text="이름 (user_name)", **_e); e_name.pack(fill="x", padx=16, pady=5)
+        e_rank = ctk.CTkEntry(pop, placeholder_text="직책 (user_rank)", **_e); e_rank.pack(fill="x", padx=16, pady=5)
+        e_phone = ctk.CTkEntry(pop, placeholder_text="전화번호 (user_phone)", **_e); e_phone.pack(fill="x", padx=16, pady=5)
+        e_email = ctk.CTkEntry(pop, placeholder_text="이메일 (user_email)", **_e); e_email.pack(fill="x", padx=16, pady=5)
         if profile.get("user_name"): e_name.insert(0, profile.get("user_name", ""))
         if profile.get("user_rank"): e_rank.insert(0, profile.get("user_rank", ""))
         if profile.get("user_phone"): e_phone.insert(0, profile.get("user_phone", ""))
@@ -822,17 +955,17 @@ class ModernMailSender(ctk.CTk):
         t1_scroll.pack(fill="both", expand=True, padx=8, pady=8)
 
         setup_box = ctk.CTkFrame(t1_scroll, fg_color="transparent")
-        setup_box.pack(fill="x")
-        _e = {"width": 320, "height": 38, "font": self._font_body}
+        setup_box.pack(fill="x", expand=True)
+        _e = {"height": 38, "font": self._font_body}
         ctk.CTkLabel(setup_box, text="SMTP 계정", font=self._font_title).pack(anchor="w", pady=(0, 4))
         e_id = ctk.CTkEntry(setup_box, placeholder_text="아이디", **_e)
-        e_id.pack(pady=5)
+        e_id.pack(fill="x", pady=5)
         e_pw = ctk.CTkEntry(setup_box, placeholder_text="앱 비밀번호", show="*", **_e)
-        e_pw.pack(pady=5)
+        e_pw.pack(fill="x", pady=5)
         e_smtp = ctk.CTkEntry(setup_box, placeholder_text="SMTP 주소", **_e)
-        e_smtp.pack(pady=5)
+        e_smtp.pack(fill="x", pady=5)
         e_port = ctk.CTkEntry(setup_box, placeholder_text="포트 (465)", **_e)
-        e_port.pack(pady=5)
+        e_port.pack(fill="x", pady=5)
         ctk.CTkLabel(
             setup_box,
             text="발송자 정보는 로그인 사용자 기준으로 공통 사용됩니다.",
@@ -895,23 +1028,25 @@ class ModernMailSender(ctk.CTk):
             text="서버 연결 테스트 및 저장",
             fg_color="#28a745",
             command=verify,
-            width=320,
             height=38,
             font=self._font_small,
-        ).pack(pady=12)
+        ).pack(fill="x", pady=12)
 
         list_f = ctk.CTkFrame(t2, fg_color="transparent")
         list_f.pack(fill="both", expand=True, padx=8, pady=8)
+        tree_wrap = ctk.CTkFrame(list_f, fg_color="transparent")
+        tree_wrap.pack(fill="both", expand=True, pady=(0, 6))
         tree = ttk.Treeview(
-            list_f, columns=("no", "comp", "email"), show="headings", height=10,
+            tree_wrap, columns=("no", "comp", "email"), show="headings", height=8,
             selectmode="extended"
         )
-        tree.column("no", width=50, anchor="center")
-        tree.column("comp", width=180, anchor="w")
-        tree.column("email", width=220, anchor="w")
+        tree.column("no", width=48, anchor="center", stretch=False, minwidth=36)
+        tree.column("comp", width=200, anchor="w", stretch=True, minwidth=60)
+        tree.column("email", width=240, anchor="w", stretch=True, minwidth=80)
         tree.heading("no", text="No"); tree.heading("comp", text="업체명"); tree.heading("email", text="이메일")
         self.tree_views[task_key] = tree
-        tree.pack(fill="both", expand=True, pady=(0, 6))
+        tree.pack(fill="both", expand=True)
+        self._bind_recipients_tree_autosize(tree_wrap, tree)
 
         count_lbl = ctk.CTkLabel(list_f, text="등록된 수신처 없음", font=self._font_small, text_color="#bdc3c7")
         count_lbl.pack(anchor="w", pady=(0, 6))
@@ -1026,16 +1161,36 @@ class ModernMailSender(ctk.CTk):
             self.save_recipients_rows(task_key, rows, headers)
 
         btn_row = ctk.CTkFrame(list_f, fg_color="transparent")
-        btn_row.pack(pady=4)
-        ctk.CTkButton(btn_row, text="📁 엑셀 추가하기", command=load_excel, font=self._font_small).pack(side="left", padx=4)
-        ctk.CTkButton(btn_row, text="🧹 전체 초기화", fg_color="#7f8c8d", command=clear_excel, font=self._font_small).pack(side="left", padx=4)
-        ctk.CTkButton(btn_row, text="🗑 선택 행 삭제", fg_color="#c0392b", command=delete_selected, font=self._font_small).pack(side="left", padx=4)
-        ctk.CTkLabel(btn_row, text="(Ctrl·Shift+클릭으로 여러 행 선택)", font=("맑은 고딕", 10), text_color="#7f8c8d").pack(side="left", padx=8)
+        btn_row.pack(fill="x", pady=4)
+        btn_inner = ctk.CTkFrame(btn_row, fg_color="transparent")
+        btn_inner.pack(fill="x")
+        ctk.CTkButton(btn_inner, text="📁 엑셀 추가하기", command=load_excel, font=self._font_small).pack(side="left", padx=4)
+        ctk.CTkButton(btn_inner, text="🧹 전체 초기화", fg_color="#7f8c8d", command=clear_excel, font=self._font_small).pack(side="left", padx=4)
+        ctk.CTkButton(btn_inner, text="🗑 선택 행 삭제", fg_color="#c0392b", command=delete_selected, font=self._font_small).pack(side="left", padx=4)
+        ctk.CTkLabel(
+            btn_row,
+            text="(Ctrl·Shift+클릭으로 여러 행 선택)",
+            font=("맑은 고딕", 10),
+            text_color="#7f8c8d",
+            anchor="w",
+        ).pack(fill="x", padx=4, pady=(6, 0))
 
         export_btn_row = ctk.CTkFrame(list_f, fg_color="transparent")
-        export_btn_row.pack(pady=4)
-        ctk.CTkButton(export_btn_row, text="📊 발송 결과 엑셀로 저장", fg_color="#9b59b6", command=lambda: self._export_to_excel(task_key), font=self._font_small).pack(side="left", padx=4)
-        ctk.CTkButton(export_btn_row, text="🚫 수신 거부 목록 관리", fg_color="#e74c3c", command=self._open_blacklist_manager, font=self._font_small).pack(side="left", padx=4)
+        export_btn_row.pack(fill="x", pady=4)
+        ctk.CTkButton(
+            export_btn_row,
+            text="📊 발송 결과 엑셀로 저장",
+            fg_color="#9b59b6",
+            command=lambda: self._export_to_excel(task_key),
+            font=self._font_small,
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            export_btn_row,
+            text="🚫 수신 거부 목록 관리",
+            fg_color="#e74c3c",
+            command=self._open_blacklist_manager,
+            font=self._font_small,
+        ).pack(side="left", padx=4)
 
         # 재실행 후에도 수신처 자동 복원
         state = self.load_recipients_state(task_key)
@@ -1059,12 +1214,30 @@ class ModernMailSender(ctk.CTk):
         cur_d = {"files": [], "imgs": {}}
         toolbar = ctk.CTkFrame(send_f, fg_color="transparent")
         toolbar.pack(fill="x", pady=4)
-        ctk.CTkButton(toolbar, text="📂 템플릿", width=90, height=32, font=self._font_small, command=lambda: self.open_tpl_library(title_e, body_t, sender_e, cur_d, f_lbl, i_lbl)).pack(side="left", padx=3)
-        ctk.CTkButton(toolbar, text="✍️ 에디터", width=90, height=32, fg_color="#2980b9", font=self._font_small, command=lambda: self._open_editor_for_body(body_t)).pack(side="left", padx=3)
+        for c in range(8):
+            toolbar.grid_columnconfigure(c, weight=0)
+        toolbar.grid_columnconfigure(4, weight=1)
+        ctk.CTkButton(
+            toolbar,
+            text="📂 템플릿",
+            width=88,
+            height=32,
+            font=self._font_small,
+            command=lambda: self.open_tpl_library(title_e, body_t, sender_e, cur_d, f_lbl, i_lbl),
+        ).grid(row=0, column=0, padx=2, pady=2, sticky="w")
+        ctk.CTkButton(
+            toolbar,
+            text="✍️ 에디터",
+            width=88,
+            height=32,
+            fg_color="#2980b9",
+            font=self._font_small,
+            command=lambda: self._open_editor_for_body(body_t),
+        ).grid(row=0, column=1, padx=2, pady=2, sticky="w")
         ctk.CTkButton(
             toolbar,
             text="🔍 미리보기",
-            width=90,
+            width=88,
             height=32,
             fg_color="#7f8c8d",
             font=self._font_small,
@@ -1074,10 +1247,34 @@ class ModernMailSender(ctk.CTk):
                 body_t.get("1.0", "end-1c"),
                 tree,
             ),
-        ).pack(side="left", padx=3)
-        ctk.CTkButton(toolbar, text="💾 저장", fg_color="#28a745", width=80, height=32, font=self._font_small, command=lambda: self.save_tpl(title_e, body_t, sender_e, cur_d, task_key)).pack(side="left", padx=3)
-        ctk.CTkButton(toolbar, text="📎 파일", width=80, height=32, fg_color="#555", font=self._font_small, command=lambda: self.attach_file(cur_d, f_lbl)).pack(side="right", padx=3)
-        ctk.CTkButton(toolbar, text="🖼️ CID", width=80, height=32, fg_color="#555", font=self._font_small, command=lambda: self.attach_cid(cur_d, i_lbl)).pack(side="right", padx=3)
+        ).grid(row=0, column=2, padx=2, pady=2, sticky="w")
+        ctk.CTkButton(
+            toolbar,
+            text="💾 저장",
+            fg_color="#28a745",
+            width=78,
+            height=32,
+            font=self._font_small,
+            command=lambda: self.save_tpl(title_e, body_t, sender_e, cur_d, task_key),
+        ).grid(row=0, column=3, padx=2, pady=2, sticky="w")
+        ctk.CTkButton(
+            toolbar,
+            text="📎 파일",
+            width=78,
+            height=32,
+            fg_color="#555",
+            font=self._font_small,
+            command=lambda: self.attach_file(cur_d, f_lbl),
+        ).grid(row=0, column=6, padx=2, pady=2, sticky="e")
+        ctk.CTkButton(
+            toolbar,
+            text="🖼️ CID",
+            width=78,
+            height=32,
+            fg_color="#555",
+            font=self._font_small,
+            command=lambda: self.attach_cid(cur_d, i_lbl),
+        ).grid(row=0, column=7, padx=2, pady=2, sticky="e")
 
         title_e = ctk.CTkEntry(send_f, placeholder_text="제목 {업체명}", height=38, font=self._font_body); title_e.pack(fill="x", pady=4)
         sender_e = ctk.CTkEntry(send_f, placeholder_text="보내는 사람 이름", height=38, border_color="#1F6AA5", font=self._font_body); sender_e.pack(fill="x", pady=4)
@@ -1089,7 +1286,11 @@ class ModernMailSender(ctk.CTk):
         ).pack(anchor="w", pady=(0, 4))
         tag_btn_row = ctk.CTkFrame(send_f, fg_color="transparent")
         tag_btn_row.pack(fill="x", pady=(0, 4))
-        ctk.CTkLabel(tag_btn_row, text="빠른 삽입:", font=("맑은 고딕", 10), text_color="#95a5a6").pack(side="left", padx=(0, 6))
+        tag_btn_row.grid_columnconfigure(1, weight=1)
+        tag_btn_row.grid_columnconfigure(2, weight=1)
+        ctk.CTkLabel(tag_btn_row, text="빠른 삽입:", font=("맑은 고딕", 10), text_color="#95a5a6").grid(
+            row=0, column=0, rowspan=2, padx=(0, 8), pady=2, sticky="nw"
+        )
 
         def _insert_user_tag(token):
             try:
@@ -1098,16 +1299,15 @@ class ModernMailSender(ctk.CTk):
             except Exception:
                 pass
 
-        for _token in ("{{내이름}}", "{{내직책}}", "{{내전화번호}}", "{{내이메일}}"):
+        for i, _token in enumerate(("{{내이름}}", "{{내직책}}", "{{내전화번호}}", "{{내이메일}}")):
             ctk.CTkButton(
                 tag_btn_row,
                 text=_token,
-                width=82,
-                height=26,
+                height=28,
                 fg_color="#3b3b3b",
                 font=("맑은 고딕", 10),
                 command=lambda t=_token: _insert_user_tag(t),
-            ).pack(side="left", padx=2)
+            ).grid(row=i // 2, column=1 + (i % 2), padx=2, pady=2, sticky="ew")
         body_t = ctk.CTkTextbox(send_f, height=110, font=self._font_body)
         body_t.pack(fill="both", expand=True, pady=4)
 
@@ -1122,11 +1322,15 @@ class ModernMailSender(ctk.CTk):
         interval_cb.pack(side="left")
 
         prevent_dup_var = ctk.BooleanVar(value=True)
+        dup_hint_f = ctk.CTkFrame(send_f, fg_color="transparent")
+        dup_hint_f.pack(fill="x", pady=(0, 2))
         ctk.CTkLabel(
-            interval_f,
-            text="중복 차단: 같은 사용자+같은 이메일+같은 템플릿만 스킵합니다.",
+            dup_hint_f,
+            text="중복 차단: 같은 로그인 계정+같은 이메일+같은 템플릿만 스킵합니다.",
             font=("맑은 고딕", 11),
-        ).pack(side="left", padx=12)
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", anchor="w")
 
         public_filter_var = ctk.BooleanVar(value=False)
         filter_banner = ctk.CTkFrame(send_f, fg_color="#4a3a10", corner_radius=8)
@@ -1144,7 +1348,7 @@ class ModernMailSender(ctk.CTk):
         ).pack(anchor="w", padx=12, pady=(10, 4))
         ctk.CTkLabel(
             filter_banner,
-            text="켜면 해당 수신처는 발송하지 않으며, 발송내역(DB/시트)에도 남기지 않습니다.",
+            text="켜면 해당 수신처는 발송하지 않으며, 로컬 발송 기록(DB)에도 남기지 않습니다.",
             font=("맑은 고딕", 10),
             text_color="#dfe6e9",
         ).pack(anchor="w", padx=12, pady=(0, 10))
@@ -1303,7 +1507,12 @@ class ModernMailSender(ctk.CTk):
         pop = ctk.CTkToplevel(self)
         pop.title("메시지 미리보기")
         pop.geometry("760x620")
+        pop.minsize(440, 400)
         pop.attributes("-topmost", True)
+        try:
+            pop.transient(self)
+        except Exception:
+            pass
         ctk.CTkLabel(pop, text="최종 치환 미리보기", font=("맑은 고딕", 15, "bold")).pack(anchor="w", padx=12, pady=(12, 6))
         ctk.CTkLabel(
             pop,
@@ -1445,7 +1654,7 @@ class ModernMailSender(ctk.CTk):
                 self.write_log(p, i, "❌ 계정/수신처 부족")
                 return
 
-            # v2.6.5: 같은 사용자+같은 이메일+같은 템플릿만 스킵.
+            # v2.7.0: 같은 로그인 아이디(account_id)+이메일+템플릿 스킵(과거 행은 표시명으로 하위 호환).
             actual_template = _dedup_template_key(template_name, title)
 
             # Phase 4: MIME 1건씩 조립→즉시 발송 (pre_composed 누적 제거). 스킵/간격은 기존과 동일.
@@ -1465,7 +1674,7 @@ class ModernMailSender(ctk.CTk):
                             self.write_log(
                                 p,
                                 i,
-                                f"🚫 [{idx}/{len(all_rows)}] 스킵: {comp} (동일 사용자·동일 템플릿 재발송) <{email}> 「{actual_template}」",
+                                f"🚫 [{idx}/{len(all_rows)}] 스킵: {comp} (동일 계정·동일 템플릿 재발송) <{email}> 「{actual_template}」",
                             )
                             continue
                     if apply_public_filter and check_smart_filter(email, comp):
@@ -1823,8 +2032,17 @@ class ModernMailSender(ctk.CTk):
                 self.current_template_name[task_key] = n
 
     def open_tpl_library(self, t, b, s, d, f_l, i_l):
-        pop = ctk.CTkToplevel(self); pop.title("템플릿"); pop.geometry("300x400"); pop.attributes("-topmost", True)
-        frame = ctk.CTkScrollableFrame(pop); frame.pack(fill="both", expand=True, padx=5, pady=5)
+        pop = ctk.CTkToplevel(self)
+        pop.title("템플릿")
+        pop.geometry("320x420")
+        pop.minsize(260, 280)
+        pop.attributes("-topmost", True)
+        try:
+            pop.transient(self)
+        except Exception:
+            pass
+        frame = ctk.CTkScrollableFrame(pop)
+        frame.pack(fill="both", expand=True, padx=5, pady=5)
         with open(self.template_file, 'r', encoding='utf-8') as f:
             tpls = json.load(f)
             for name in tpls.keys():
@@ -1839,7 +2057,7 @@ class ModernMailSender(ctk.CTk):
                         f_l.configure(text=f"📎 첨부: {len(d['files'])}개"); i_l.configure(text=f"🖼️ CID: {len(d['imgs'])}개")
                         self.current_template_name[task_key] = n
                     pop.destroy()
-                ctk.CTkButton(row, text=name, command=apply, width=180).pack(side="left", expand=True, fill="x", padx=1)
+                ctk.CTkButton(row, text=name, command=apply).pack(side="left", expand=True, fill="x", padx=1)
                 ctk.CTkButton(row, text="X", width=25, fg_color="red", command=lambda n=name: self.del_tpl(n, pop)).pack(side="right")
 
     def del_tpl(self, n, p):

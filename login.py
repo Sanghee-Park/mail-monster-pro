@@ -15,7 +15,7 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Phase 6 Task 6-1: 구글 시트 버전과 비교할 앱 현재 버전
-CURRENT_VERSION = "v2.6.8"
+CURRENT_VERSION = "v2.7.0"
 SPREADSHEET_KEY = "1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw"
 
 # GitHub 릴리스 연동: 시트 B1이 비어 있거나 "GITHUB"이면 최신 Release의 .exe URL 사용 (구글 드라이브 불필요)
@@ -198,6 +198,8 @@ class LoginApp(ctk.CTk):
         self.update_release_page_url = ""
         self.title(f"메일 몬스터 - 보안 로그인 ({CURRENT_VERSION})")
         self.geometry("400x650")
+        self.minsize(320, 480)
+        self.resizable(True, True)
         ctk.set_appearance_mode("dark")
         try: self.iconbitmap(os.path.join(BASE_DIR, "pro.ico"))
         except: pass
@@ -422,17 +424,31 @@ Remove-Item -LiteralPath '{script_ps}' -Force
         self.deiconify()
 
     def setup_login_ui(self):
-        ctk.CTkLabel(self, text="MAIL MONSTER", font=("Impact", 35)).pack(pady=(40, 4))
-        ctk.CTkLabel(self, text=CURRENT_VERSION, font=("맑은 고딕", 12), text_color="#7f8c8d").pack(pady=(0, 16))
-        self.id_ent = ctk.CTkEntry(self, placeholder_text="아이디", width=280, height=45); self.id_ent.pack(pady=10)
-        self.pw_ent = ctk.CTkEntry(self, placeholder_text="비밀번호", show="*", width=280, height=45); self.pw_ent.pack(pady=10)
-        
-        cb_f = ctk.CTkFrame(self, fg_color="transparent"); cb_f.pack(pady=10)
-        self.save_id_var = ctk.BooleanVar(); ctk.CTkCheckBox(cb_f, text="ID 저장", variable=self.save_id_var).pack(side="left", padx=5)
-        self.auto_login_var = ctk.BooleanVar(); ctk.CTkCheckBox(cb_f, text="자동 로그인", variable=self.auto_login_var).pack(side="left", padx=5)
+        wrap = ctk.CTkFrame(self, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=20, pady=12)
+        ctk.CTkLabel(wrap, text="MAIL MONSTER", font=("Impact", 35)).pack(pady=(28, 4))
+        ctk.CTkLabel(wrap, text=CURRENT_VERSION, font=("맑은 고딕", 12), text_color="#7f8c8d").pack(pady=(0, 16))
+        self.id_ent = ctk.CTkEntry(wrap, placeholder_text="아이디", height=45)
+        self.id_ent.pack(fill="x", pady=10)
+        self.pw_ent = ctk.CTkEntry(wrap, placeholder_text="비밀번호", show="*", height=45)
+        self.pw_ent.pack(fill="x", pady=10)
 
-        ctk.CTkButton(self, text="로그인", width=280, height=45, command=self.check_login).pack(pady=20)
-        ctk.CTkButton(self, text="회원가입 신청", width=280, height=40, fg_color="transparent", border_width=1, command=self.open_reg).pack()
+        cb_f = ctk.CTkFrame(wrap, fg_color="transparent")
+        cb_f.pack(fill="x", pady=10)
+        self.save_id_var = ctk.BooleanVar()
+        ctk.CTkCheckBox(cb_f, text="ID 저장", variable=self.save_id_var).pack(side="left", padx=5)
+        self.auto_login_var = ctk.BooleanVar()
+        ctk.CTkCheckBox(cb_f, text="자동 로그인", variable=self.auto_login_var).pack(side="left", padx=5)
+
+        ctk.CTkButton(wrap, text="로그인", height=45, command=self.check_login).pack(fill="x", pady=20)
+        ctk.CTkButton(
+            wrap,
+            text="회원가입 신청",
+            height=40,
+            fg_color="transparent",
+            border_width=1,
+            command=self.open_reg,
+        ).pack(fill="x")
 
     def load_settings(self):
         if os.path.exists(self.settings_file):
@@ -474,20 +490,20 @@ Remove-Item -LiteralPath '{script_ps}' -Force
                     latest = gh_tag
         return latest, url, sha256_hex, release_page
 
-    def _launch_main_app(self, user_name, grade, rem):
+    def _launch_main_app(self, user_name, grade, rem, login_user_id=""):
         self.withdraw()
         self.quit()
-        self.on_success(user_name, grade, rem)
+        self.on_success(user_name, grade, rem, login_user_id)
 
-    def _check_update_after_login(self, user_name, grade, rem):
+    def _check_update_after_login(self, user_name, grade, rem, login_user_id=""):
         """로그인 성공 직후 버전 확인: 같으면 실행, 다르면 권고 후 업데이트."""
         latest_version, update_url, sha256_exp, release_page = self._fetch_update_info()
         # A1에 버전이 있고 앱과 동일하면 B1(URL) 유무와 관계없이 즉시 실행 (같은 버전인데도 권고 팝업 방지)
         if latest_version and _versions_effectively_equal(latest_version, CURRENT_VERSION):
-            self._launch_main_app(user_name, grade, rem)
+            self._launch_main_app(user_name, grade, rem, login_user_id)
             return
         if (not latest_version) or (not update_url):
-            self._launch_main_app(user_name, grade, rem)
+            self._launch_main_app(user_name, grade, rem, login_user_id)
             return
 
         msg = (
@@ -500,7 +516,7 @@ Remove-Item -LiteralPath '{script_ps}' -Force
         if do_update:
             self._set_update_required(latest_version, update_url, sha256_exp, release_page)
         else:
-            self._launch_main_app(user_name, grade, rem)
+            self._launch_main_app(user_name, grade, rem, login_user_id)
 
     def check_login(self):
         uid, upw = self.id_ent.get().strip(), self.pw_ent.get().strip()
@@ -522,7 +538,7 @@ Remove-Item -LiteralPath '{script_ps}' -Force
                     rem = "PERMANENT" if raw_period == "영구" else str((datetime.strptime(raw_period, '%Y-%m-%d') - datetime.now()).days + 1)
                     with open(self.settings_file, "w", encoding='utf-8') as f:
                         json.dump({"id": uid if self.save_id_var.get() else "", "pw": upw if self.auto_login_var.get() else "", "save_id": self.save_id_var.get(), "auto_login": self.auto_login_var.get()}, f)
-                    self._check_update_after_login(user_name, grade, rem)
+                    self._check_update_after_login(user_name, grade, rem, uid)
                     return
             messagebox.showerror("실패", "계정 정보가 틀립니다.")
         except Exception as e: messagebox.showerror("오류", f"접속 실패: {e}")
@@ -531,15 +547,23 @@ Remove-Item -LiteralPath '{script_ps}' -Force
         pop = ctk.CTkToplevel(self)
         pop.title("회원가입 신청")
         pop.geometry("360x420")
+        pop.minsize(300, 380)
         pop.attributes("-topmost", True)
+        try:
+            pop.transient(self)
+        except Exception:
+            pass
 
         ctk.CTkLabel(pop, text="회원가입 신청", font=("맑은 고딕", 16, "bold")).pack(pady=(18, 10))
         ctk.CTkLabel(pop, text="신청 후 상태는 '승인대기'로 등록됩니다.", font=("맑은 고딕", 11), text_color="#95a5a6").pack(pady=(0, 10))
 
-        ent_w, ent_h = 280, 42
-        rid = ctk.CTkEntry(pop, placeholder_text="아이디", width=ent_w, height=ent_h); rid.pack(pady=6)
-        rpw = ctk.CTkEntry(pop, placeholder_text="비밀번호", show="*", width=ent_w, height=ent_h); rpw.pack(pady=6)
-        rname = ctk.CTkEntry(pop, placeholder_text="이름(표시명)", width=ent_w, height=ent_h); rname.pack(pady=6)
+        ent_h = 42
+        rid = ctk.CTkEntry(pop, placeholder_text="아이디", height=ent_h)
+        rid.pack(fill="x", padx=20, pady=6)
+        rpw = ctk.CTkEntry(pop, placeholder_text="비밀번호", show="*", height=ent_h)
+        rpw.pack(fill="x", padx=20, pady=6)
+        rname = ctk.CTkEntry(pop, placeholder_text="이름(표시명)", height=ent_h)
+        rname.pack(fill="x", padx=20, pady=6)
 
         status_lbl = ctk.CTkLabel(pop, text="", font=("맑은 고딕", 11), text_color="#bdc3c7")
         status_lbl.pack(pady=(10, 0))
@@ -576,5 +600,5 @@ Remove-Item -LiteralPath '{script_ps}' -Force
 
             threading.Thread(target=worker, daemon=True).start()
 
-        ctk.CTkButton(pop, text="가입 신청", width=280, height=44, command=submit).pack(pady=(18, 8))
-        ctk.CTkButton(pop, text="닫기", width=280, height=40, fg_color="transparent", border_width=1, command=pop.destroy).pack()
+        ctk.CTkButton(pop, text="가입 신청", height=44, command=submit).pack(fill="x", padx=20, pady=(18, 8))
+        ctk.CTkButton(pop, text="닫기", height=40, fg_color="transparent", border_width=1, command=pop.destroy).pack(fill="x", padx=20)

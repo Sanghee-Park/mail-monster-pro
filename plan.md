@@ -1,4 +1,4 @@
-# MAIL MONSTER PRO 계획 (v2.6.8 지능형 공공/단체 필터링 업데이트)
+# MAIL MONSTER PRO 계획 (v2.7.0 계정 기준 중복 · 발송내역 시트 옵션)
 
 *(...기존 Phase 1 ~ 5 내용은 그대로 유지...)*
 
@@ -30,3 +30,5 @@
 
 - **구현 위치**: `main_ui.py` — `check_smart_filter()`, 메시지 탭 `public_filter_var` + 배너 체크박스, `real_engine(..., apply_public_filter, ...)` 분기.
 - **v2.6.8**: `CHANGELOG.md` / `login.py` / Inno 버전 문자열 동기화.
+- **v2.6.9**: 구글 시트 `발송내역` append·기동 동기화 **기본 OFF**(`sheet_sent_log_enabled.txt` 또는 `MAILMONSTER_ENABLE_SHEET_SENT_LOG=1`로 선택적 ON). 중복 차단은 로컬 `sent_log`만 사용.
+- **v2.7.0**: `sent_log.account_id`(로그인 아이디) + 시트 F열 `로그인ID`. PC 간은 시트 연동 시에만 계정 단위 중복 공유.

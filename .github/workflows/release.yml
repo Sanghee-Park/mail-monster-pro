@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "빌드할 Git 태그 (예: v2.6.7)"
+        description: "빌드할 Git 태그 (예: v2.6.8)"
         required: true
         type: string
 

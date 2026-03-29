@@ -42,6 +42,29 @@ else:
 # Phase 4: 계정별 로그 박스 무한 누적 방지 (발송 로직과 무관)
 LOG_CONSOLE_MAX_LINES = 1000
 
+# Phase 6 (v2.6.8): 공공기관/단체 필터 — 이메일 도메인 또는 업체명 키워드 일치 시 발송 스킵(옵션)
+_SMART_FILTER_DOMAIN_SUFFIXES = (".go.kr", ".or.kr", ".re.kr", ".ac.kr", ".mil.kr")
+_SMART_FILTER_COMPANY_KEYWORDS = ("협회", "학회", "조합", "중앙회", "공사", "공단", "재단")
+
+
+def check_smart_filter(email, comp_name):
+    """공공/단체 규칙에 해당하면 True(스킵 대상)."""
+    e = (email or "").strip().lower()
+    if "@" in e:
+        try:
+            _, domain = e.rsplit("@", 1)
+            domain = domain.strip()
+            for suf in _SMART_FILTER_DOMAIN_SUFFIXES:
+                if domain.endswith(suf):
+                    return True
+        except Exception:
+            pass
+    comp = str(comp_name or "")
+    for kw in _SMART_FILTER_COMPANY_KEYWORDS:
+        if kw in comp:
+            return True
+    return False
+
 
 def _dedup_template_key(template_name, title_fallback=""):
     """Task 2-2: 중복 검사·sent_log에 기록하는 템플릿 키. 저장된 템플릿명 우선, 없으면 제목. 양쪽 strip()."""
@@ -91,7 +114,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.6.7"
+            CURRENT_VERSION = "v2.6.8"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686") # 💡 30% 축소 사이즈 적용
         ctk.set_appearance_mode("dark")
@@ -557,7 +580,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.6.7"
+            _ver = "v2.6.8"
         ctk.CTkLabel(header, text=f"🚀 MAIL MONSTER PRO {_ver}", font=("맑은 고딕", 18, "bold"), text_color=theme_color).pack(side="left", padx=20, pady=5)
         
         # 중앙: 통계 라벨
@@ -1105,10 +1128,32 @@ class ModernMailSender(ctk.CTk):
             font=("맑은 고딕", 11),
         ).pack(side="left", padx=12)
 
+        public_filter_var = ctk.BooleanVar(value=False)
+        filter_banner = ctk.CTkFrame(send_f, fg_color="#4a3a10", corner_radius=8)
+        filter_banner.pack(fill="x", pady=(10, 6))
+        ctk.CTkCheckBox(
+            filter_banner,
+            text="공공기관/단체 필터 적용  (go.kr, or.kr, 협회·학회·조합·중앙회·공사·공단·재단 등)",
+            variable=public_filter_var,
+            font=("맑은 고딕", 12, "bold"),
+            text_color="#ffeaa7",
+            fg_color="#d4a017",
+            hover_color="#c9a227",
+            checkbox_width=22,
+            checkbox_height=22,
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+        ctk.CTkLabel(
+            filter_banner,
+            text="켜면 해당 수신처는 발송하지 않으며, 발송내역(DB/시트)에도 남기지 않습니다.",
+            font=("맑은 고딕", 10),
+            text_color="#dfe6e9",
+        ).pack(anchor="w", padx=12, pady=(0, 10))
+
         def start():
             self.stop_flags[task_key] = False
             interval = interval_cb.get()
             prevent_dup = prevent_dup_var.get()
+            apply_public_filter = public_filter_var.get()
             profile = self.get_login_user_profile()
             merged_text = f"{title_e.get()}\n{body_t.get('1.0', 'end-1c')}"
             used_tags = [t for t in ("{{내이름}}", "{{내직책}}", "{{내전화번호}}", "{{내이메일}}") if t in merged_text]
@@ -1150,6 +1195,7 @@ class ModernMailSender(ctk.CTk):
                     cur_d,
                     interval,
                     prevent_dup,
+                    apply_public_filter,
                     tree,
                     send_b,
                     stop_b,
@@ -1383,7 +1429,7 @@ class ModernMailSender(ctk.CTk):
                 return False, str(e)
         return False, "알 수 없는 오류"
 
-    def real_engine(self, p, i, title, body, s_name, data, interval, prevent_dup, tree, s_b, st_b, template_name=""): #
+    def real_engine(self, p, i, title, body, s_name, data, interval, prevent_dup, apply_public_filter, tree, s_b, st_b, template_name=""): #
         key = f"{p}_{i}"; self.after(0, lambda: (s_b.configure(state="disabled"), st_b.configure(state="normal", fg_color="#dc3545")))
         try:
             with open(self.config_file, 'r', encoding='utf-8') as f: config = json.load(f).get(key)
@@ -1422,6 +1468,13 @@ class ModernMailSender(ctk.CTk):
                                 f"🚫 [{idx}/{len(all_rows)}] 스킵: {comp} (동일 사용자·동일 템플릿 재발송) <{email}> 「{actual_template}」",
                             )
                             continue
+                    if apply_public_filter and check_smart_filter(email, comp):
+                        self.write_log(
+                            p,
+                            i,
+                            f"🚫 [{idx}/{len(all_rows)}] 필터링: {comp} <{email}> (공공/단체 규칙 일치로 스킵됨)",
+                        )
+                        continue
                     if self._is_blacklisted(email):
                         self.write_log(p, i, f"🚫 [{idx}/{len(all_rows)}] {comp} <{email}> 스킵(수신 거부 업체)")
                         continue

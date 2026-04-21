@@ -1,6 +1,6 @@
 import customtkinter as ctk
-from tkinter import ttk, filedialog, messagebox, simpledialog
-import gc, json, os, sys, random, sqlite3, re, base64
+from tkinter import ttk, filedialog, messagebox, simpledialog, Menu
+import gc, hashlib, json, os, sys, random, sqlite3, re, base64
 import smtplib, threading, time, mimetypes
 import tempfile, webbrowser
 from datetime import datetime
@@ -46,6 +46,9 @@ LOG_CONSOLE_MAX_LINES = 1000
 _SMART_FILTER_DOMAIN_SUFFIXES = (".go.kr", ".or.kr", ".re.kr", ".ac.kr", ".mil.kr")
 _SMART_FILTER_COMPANY_KEYWORDS = ("협회", "학회", "조합", "중앙회", "공사", "공단", "재단")
 
+# Phase 7 (v2.7.1): config.json 루트 메타 — 사이드바에 나열할 task_key 순서
+CONFIG_META_ACCOUNT_ORDER_KEY = "__account_order__"
+
 
 def check_smart_filter(email, comp_name):
     """공공/단체 규칙에 해당하면 True(스킵 대상)."""
@@ -64,6 +67,11 @@ def check_smart_filter(email, comp_name):
         if kw in comp:
             return True
     return False
+
+
+def _hash_body_html_sha256(body_html: str) -> str:
+    """Task 7-3: MIME에 실리는 HTML 문자열 기준 SHA256(hex). 중복 차단·sent_log.content_hash에 사용."""
+    return hashlib.sha256((body_html or "").encode("utf-8")).hexdigest()
 
 
 def _dedup_template_key(template_name, title_fallback=""):
@@ -109,24 +117,28 @@ class ModernMailSender(ctk.CTk):
         self.recipients_file = os.path.join(BASE_DIR, "recipients.json")
         self.db_path = os.path.join(BASE_DIR, "sent_history.db")
         self.log_consoles, self.stop_flags, self.tree_views, self.progress_labels = {}, {}, {}, {}
+        self._smtp_account_entries = {}
         self.current_template_name = {}
         self.icon_filename = "pro.ico"
         
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.7.0"
+            CURRENT_VERSION = "v2.7.1"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686")  # 기본 크기
         self.minsize(800, 520)  # 축소 시 레이아웃 붕괴·버튼 소실 방지
         ctk.set_appearance_mode("dark")
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         
-        for f in [self.config_file, self.template_file, self.user_profiles_file]:
-            if not os.path.exists(f): 
-                with open(f, 'w', encoding='utf-8') as file: json.dump({}, file)
+        if not os.path.exists(self.config_file):
+            self._atomic_write_json_path(self.config_file, {}, indent=4, ensure_ascii=False)
+        if not os.path.exists(self.template_file):
+            self._atomic_write_json_path(self.template_file, {}, indent=4, ensure_ascii=False)
+        if not os.path.exists(self.user_profiles_file):
+            self._atomic_write_json_path(self.user_profiles_file, {}, indent=2, ensure_ascii=False)
         if not os.path.exists(self.recipients_file):
-            with open(self.recipients_file, 'w', encoding='utf-8') as file: json.dump({}, file, ensure_ascii=False, indent=2)
+            self._atomic_write_json_path(self.recipients_file, {}, indent=2, ensure_ascii=False)
         self._migrate_legacy_sender_profile_once()
         self.init_db()
         self.setup_ui()
@@ -165,11 +177,17 @@ class ModernMailSender(ctk.CTk):
             cols = [c[1] for c in con.execute("PRAGMA table_info(sent_log)").fetchall()]
             if "account_id" not in cols:
                 con.execute("ALTER TABLE sent_log ADD COLUMN account_id TEXT")
+            cols = [c[1] for c in con.execute("PRAGMA table_info(sent_log)").fetchall()]
+            if "content_hash" not in cols:
+                con.execute("ALTER TABLE sent_log ADD COLUMN content_hash TEXT")
 
             con.execute("CREATE INDEX IF NOT EXISTS idx_sent_task_email ON sent_log(task_key, email)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_sent_email_template ON sent_log(email, template_name)")
             con.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sent_account_email_tmpl ON sent_log(account_id, email, template_name)"
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sent_account_email_hash ON sent_log(account_id, email, content_hash)"
             )
 
             # 블랙리스트 테이블 (Task 5-1)
@@ -199,8 +217,7 @@ class ModernMailSender(ctk.CTk):
             return {}
 
     def _write_recipients_state_all(self, data):
-        with open(self.recipients_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        self._atomic_write_json_path(self.recipients_file, data, indent=2, ensure_ascii=False)
 
     def load_recipients_state(self, task_key):
         data = self._read_recipients_state_all()
@@ -253,7 +270,7 @@ class ModernMailSender(ctk.CTk):
             return t
         return ((subject or "").strip()[:500] or "(미지정)")
 
-    def record_success_to_db(self, task_key, provider, account_idx, comp, email, subject, template_name=""):
+    def record_success_to_db(self, task_key, provider, account_idx, comp, email, subject, template_name="", content_hash=None):
         # 수신처 불명확/실패/미전송은 저장하지 않음: 성공했을 때만 호출
         if not comp:
             return
@@ -263,10 +280,11 @@ class ModernMailSender(ctk.CTk):
         tpl = self._effective_template_for_log(template_name, subject)
         sender = (self.user_name or "").strip()
         acc = (self.login_user_id or "").strip()
+        ch = (content_hash or "").strip() or None
         con = sqlite3.connect(self.db_path)
         try:
             con.execute(
-                "INSERT INTO sent_log(task_key, provider, account_idx, comp, email, subject, template_name, sent_at, sender, account_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO sent_log(task_key, provider, account_idx, comp, email, subject, template_name, sent_at, sender, account_id, content_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     task_key,
                     provider,
@@ -278,20 +296,23 @@ class ModernMailSender(ctk.CTk):
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     sender,
                     acc or None,
+                    ch,
                 ),
             )
             con.commit()
         finally:
             con.close()
 
-    def check_duplicate_send_status(self, email, template_name=""):
-        """같은 로그인 계정(아이디)+같은 이메일+같은 템플릿이면 스킵. account_id가 없는 과거 행은 표시명(sender)으로만 매칭(하위 호환).
-        반환: (스킵 여부, 사유, 이전_발송자_표시명)
-        - 타 계정 이력은 스킵 사유가 아님(발송 허용).
+    def check_duplicate_send_status(self, email, content_hash="", template_name=""):
+        """v2.7.1 Task 7-3: `content_hash`가 주어지면 동일 계정+동일 이메일+동일 본문(해시)일 때만 스킵.
+        `content_hash`가 비어 있으면(구 호출) 기존처럼 template_name만으로 판별.
+        DB에 content_hash가 없는 과거 행은 본문 해시 비교에서 제외(템플릿명만으로는 새 본문을 막지 않음).
+        반환: (스킵 여부, 사유, 이전_발송자_표시명) — 타 계정 이력은 스킵 아님.
         """
         e = (email or "").strip()
         if not e:
             return False, None, None
+        ch_in = (content_hash or "").strip().lower()
         tpl_key = (template_name or "").strip().lower()
         me_id = (self.login_user_id or "").strip().lower()
         me_name = (self.user_name or "").strip().lower()
@@ -300,7 +321,7 @@ class ModernMailSender(ctk.CTk):
         con = sqlite3.connect(self.db_path)
         try:
             cur = con.execute(
-                "SELECT sender, template_name, account_id FROM sent_log WHERE email=? COLLATE NOCASE",
+                "SELECT sender, template_name, account_id, content_hash FROM sent_log WHERE email=? COLLATE NOCASE",
                 (e,),
             )
             rows = cur.fetchall()
@@ -308,23 +329,30 @@ class ModernMailSender(ctk.CTk):
             con.close()
         if not rows:
             return False, None, None
-        for sender, tmpl_db, acc_db in rows:
-            t = (tmpl_db or "").strip().lower()
-            if t != tpl_key:
-                continue
+
+        def _same_account(sender, acc_db):
             a = (acc_db or "").strip().lower()
             if me_id:
                 if a and a == me_id:
-                    prior = (sender or "").strip() or "(미기록)"
-                    return True, "same_template_same_sender", prior
+                    return True
                 if not a and me_name and (sender or "").strip().lower() == me_name:
-                    prior = (sender or "").strip() or "(미기록)"
-                    return True, "same_template_same_sender", prior
-            else:
-                s = (sender or "").strip().lower()
-                if s and s == me_name:
-                    prior = (sender or "").strip() or "(미기록)"
-                    return True, "same_template_same_sender", prior
+                    return True
+                return False
+            s = (sender or "").strip().lower()
+            return bool(s and s == me_name)
+
+        for sender, tmpl_db, acc_db, ch_db in rows:
+            if not _same_account(sender, acc_db):
+                continue
+            prior = (sender or "").strip() or "(미기록)"
+            if ch_in:
+                ch_row = (ch_db or "").strip().lower()
+                if ch_row and ch_row == ch_in:
+                    return True, "same_body_same_sender", prior
+                continue
+            t = (tmpl_db or "").strip().lower()
+            if t == tpl_key:
+                return True, "same_template_same_sender", prior
         return False, None, None
 
     def _profile_key_for_login_user(self):
@@ -339,8 +367,12 @@ class ModernMailSender(ctk.CTk):
             return {}
 
     def save_user_profiles(self, profiles):
-        with open(self.user_profiles_file, "w", encoding="utf-8") as f:
-            json.dump(profiles if isinstance(profiles, dict) else {}, f, indent=2, ensure_ascii=False)
+        self._atomic_write_json_path(
+            self.user_profiles_file,
+            profiles if isinstance(profiles, dict) else {},
+            indent=2,
+            ensure_ascii=False,
+        )
 
     def get_login_user_profile(self):
         profiles = self.load_user_profiles()
@@ -379,7 +411,11 @@ class ModernMailSender(ctk.CTk):
             return
         if not isinstance(cfg, dict):
             return
-        for entry in cfg.values():
+        for key, entry in cfg.items():
+            if key == CONFIG_META_ACCOUNT_ORDER_KEY:
+                continue
+            if not isinstance(entry, dict):
+                continue
             sp = _parse_sender_profile_from_entry(entry)
             if any((sp.get(k) or "").strip() for k in ("user_name", "user_rank", "user_phone", "user_email")):
                 self.save_login_user_profile(sp)
@@ -457,8 +493,8 @@ class ModernMailSender(ctk.CTk):
                 if cur.fetchone():
                     continue
                 con.execute(
-                    """INSERT INTO sent_log(task_key, provider, account_idx, comp, email, subject, template_name, sent_at, sender, account_id)
-                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO sent_log(task_key, provider, account_idx, comp, email, subject, template_name, sent_at, sender, account_id, content_hash)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         "cloud_sync",
                         "sheet",
@@ -470,6 +506,7 @@ class ModernMailSender(ctk.CTk):
                         sent_at,
                         sender,
                         acc_sheet or None,
+                        None,
                     ),
                 )
                 inserted += 1
@@ -668,6 +705,7 @@ class ModernMailSender(ctk.CTk):
         self._font_title = ("맑은 고딕", 14, "bold")
         self._font_body = ("맑은 고딕", 12)
         self._font_small = ("맑은 고딕", 11)
+        self._font_sidebar_active = ("맑은 고딕", 11, "bold")
         theme_color = "#8e44ad" if "관리자" in self.grade else ("#27ae60" if self.grade == "무료권" else "#2980b9")
         header = ctk.CTkFrame(self, fg_color="#1a1a1a", corner_radius=0)
         header.pack(fill="x", side="top")
@@ -676,7 +714,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.7.0"
+            _ver = "v2.7.1"
 
         title_lbl = ctk.CTkLabel(
             header,
@@ -762,7 +800,13 @@ class ModernMailSender(ctk.CTk):
         sidebar.pack_propagate(False)
         self.sidebar_frame = sidebar
 
-        ctk.CTkLabel(sidebar, text="📋 계정 목록", font=self._font_title).pack(pady=12, padx=12, anchor="w")
+        ctk.CTkLabel(sidebar, text="📋 계정 목록", font=self._font_title).pack(pady=(12, 2), padx=12, anchor="w")
+        ctk.CTkLabel(
+            sidebar,
+            text="우클릭 또는 ⚙ — 별칭·순서·삭제",
+            font=("맑은 고딕", 10),
+            text_color="#7f8c8d",
+        ).pack(pady=(0, 6), padx=12, anchor="w")
         scrollable = ctk.CTkScrollableFrame(sidebar, fg_color="transparent")
         scrollable.pack(fill="both", expand=True, padx=8, pady=4)
         self.sidebar_scrollable = scrollable
@@ -791,18 +835,246 @@ class ModernMailSender(ctk.CTk):
         self.current_profile = first_key
         if first_key and first_key in self.profile_frames:
             self.profile_frames[first_key].pack(fill="both", expand=True)
+        self._highlight_active_sidebar()
+
+    def _read_full_config(self):
+        try:
+            with open(self.config_file, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _atomic_write_json_path(self, path, data, indent=4, ensure_ascii=False):
+        """Task 7-4: JSON 파일 원자적 저장(임시 파일 후 os.replace)."""
+        path = os.path.abspath(path)
+        dname = os.path.dirname(path) or "."
+        fd, tmp = tempfile.mkstemp(prefix="mm_json_", suffix=".tmp", dir=dname)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=indent, ensure_ascii=ensure_ascii)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _atomic_write_config(self, data):
+        """config.json 원자적 저장."""
+        if not isinstance(data, dict):
+            return
+        self._atomic_write_json_path(self.config_file, data, indent=4, ensure_ascii=False)
+
+    def _configured_task_key_set(self, config):
+        ordered = getattr(self, "_all_task_keys_ordered", [])
+        out = set()
+        for tk in ordered:
+            ent = config.get(tk)
+            if isinstance(ent, dict) and str(ent.get("id") or "").strip():
+                out.add(tk)
+        return out
 
     def _get_configured_task_keys(self):
-        """config.json에 id가 있는 task_key만 정렬된 리스트로 반환 (스택형 1,2,3...용)"""
+        """config.json에 id가 있는 task_key만 반환. __account_order__가 있으면 그 순서를 우선."""
         ordered = getattr(self, "_all_task_keys_ordered", [])
         if not ordered:
             return []
+        config = self._read_full_config()
+        configured_set = self._configured_task_key_set(config)
+        custom = config.get(CONFIG_META_ACCOUNT_ORDER_KEY)
+        result, seen = [], set()
+        if isinstance(custom, list):
+            for tk in custom:
+                if tk in configured_set and tk not in seen:
+                    result.append(tk)
+                    seen.add(tk)
+        for tk in ordered:
+            if tk in configured_set and tk not in seen:
+                result.append(tk)
+                seen.add(tk)
+        return result
+
+    def _sidebar_label_text(self, task_key, index_n):
+        cfg = self._read_full_config()
+        ent = cfg.get(task_key)
+        dname = ""
+        if isinstance(ent, dict):
+            dname = (ent.get("display_name") or "").strip()
+            login_id = str(ent.get("id") or "").strip()
+        else:
+            login_id = ""
+        if dname:
+            return dname
+        if login_id:
+            return f"계정 {index_n} ({login_id})"
+        return f"계정 {index_n}"
+
+    def _popup_account_context_menu(self, task_key, x_root, y_root):
+        menu = Menu(self, tearoff=0)
+        menu.add_command(
+            label="표시 이름(별칭) 변경…",
+            command=lambda: self._rename_account_display(task_key),
+        )
+        menu.add_command(
+            label="위로 이동",
+            command=lambda: self._move_account_in_sidebar(task_key, -1),
+        )
+        menu.add_command(
+            label="아래로 이동",
+            command=lambda: self._move_account_in_sidebar(task_key, 1),
+        )
+        menu.add_separator()
+        menu.add_command(
+            label="이 슬롯 계정 삭제…",
+            command=lambda: self._delete_account_slot(task_key),
+        )
         try:
-            with open(self.config_file, "r", encoding="utf-8") as f:
-                config = json.load(f)
-            return [tk for tk in ordered if config.get(tk) and config.get(tk).get("id")]
+            menu.tk_popup(int(x_root), int(y_root))
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+            try:
+                menu.destroy()
+            except Exception:
+                pass
+
+    def _on_sidebar_account_right_click(self, event, task_key):
+        self._popup_account_context_menu(task_key, event.x_root, event.y_root)
+
+    def _open_account_manage_from_button(self, task_key, widget):
+        try:
+            widget.update_idletasks()
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + max(widget.winfo_height(), 28)
         except Exception:
-            return []
+            x, y = 0, 0
+        self._popup_account_context_menu(task_key, x, y)
+
+    def _rename_account_display(self, task_key):
+        cfg = self._read_full_config()
+        ent = cfg.get(task_key)
+        if not isinstance(ent, dict) or not str(ent.get("id") or "").strip():
+            messagebox.showinfo("안내", "연동된 계정만 별칭을 설정할 수 있습니다.", parent=self)
+            return
+        cur = (ent.get("display_name") or "").strip()
+        new_name = simpledialog.askstring(
+            "표시 이름",
+            "사이드바에 표시할 별칭(비우면 아이디 표기로 복귀):",
+            initialvalue=cur,
+            parent=self,
+        )
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if new_name:
+            ent["display_name"] = new_name
+        else:
+            ent.pop("display_name", None)
+        cfg[task_key] = ent
+        self._atomic_write_config(cfg)
+        self._rebuild_sidebar_buttons()
+
+    def _move_account_in_sidebar(self, task_key, delta):
+        keys = self._get_configured_task_keys()
+        if task_key not in keys:
+            return
+        i = keys.index(task_key)
+        j = i + int(delta)
+        if j < 0 or j >= len(keys):
+            return
+        lst = list(keys)
+        lst[i], lst[j] = lst[j], lst[i]
+        cfg = self._read_full_config()
+        cfg[CONFIG_META_ACCOUNT_ORDER_KEY] = lst
+        self._atomic_write_config(cfg)
+        self._rebuild_sidebar_buttons()
+
+    def _clear_account_ui_data(self, task_key):
+        w = self._smtp_account_entries.get(task_key)
+        if isinstance(w, dict):
+            for k in ("e_id", "e_pw", "e_smtp", "e_port"):
+                ent = w.get(k)
+                if ent is not None:
+                    try:
+                        ent.delete(0, "end")
+                    except Exception:
+                        pass
+        tree = self.tree_views.get(task_key)
+        if tree is not None:
+            try:
+                for item in tree.get_children():
+                    tree.delete(item)
+            except Exception:
+                pass
+
+    def _delete_account_slot(self, task_key):
+        cfg = self._read_full_config()
+        ent = cfg.get(task_key)
+        login_id = ""
+        if isinstance(ent, dict):
+            login_id = str(ent.get("id") or "").strip()
+        label = self._sidebar_label_text(task_key, self.task_key_to_index.get(task_key, 0) or 0)
+        if not login_id:
+            messagebox.showinfo("안내", "이 슬롯에는 저장된 SMTP 계정이 없습니다.", parent=self)
+            return
+        if not messagebox.askyesno(
+            "계정 삭제",
+            f"다음 계정 연동을 해제하고 설정을 삭제할까요?\n\n{label}\n({login_id})\n\n이 슬롯의 수신처 저장 데이터도 함께 삭제됩니다.",
+            parent=self,
+        ):
+            return
+        if task_key in cfg:
+            del cfg[task_key]
+        order = cfg.get(CONFIG_META_ACCOUNT_ORDER_KEY)
+        if isinstance(order, list):
+            cfg[CONFIG_META_ACCOUNT_ORDER_KEY] = [x for x in order if x != task_key]
+        self._atomic_write_config(cfg)
+        rdata = self._read_recipients_state_all()
+        if task_key in rdata:
+            del rdata[task_key]
+            self._write_recipients_state_all(rdata)
+        self._clear_account_ui_data(task_key)
+        was_current = getattr(self, "current_profile", None) == task_key
+        self._rebuild_sidebar_buttons()
+        new_keys = self._get_configured_task_keys()
+        cur = getattr(self, "current_profile", None)
+        if was_current or (cur and cur not in new_keys):
+            if new_keys:
+                self._switch_profile(new_keys[0])
+            else:
+                empty = self._get_first_empty_task_key()
+                if empty:
+                    self._switch_profile(empty)
+                else:
+                    self._highlight_active_sidebar()
+        else:
+            self._highlight_active_sidebar()
+
+    def _highlight_active_sidebar(self):
+        cur = getattr(self, "current_profile", None)
+        active_font = getattr(self, "_font_sidebar_active", ("맑은 고딕", 11, "bold"))
+        base_font = getattr(self, "_font_small", ("맑은 고딕", 11))
+        for tk, btn in getattr(self, "sidebar_buttons", {}).items():
+            try:
+                if tk == cur:
+                    btn.configure(fg_color="#1f538d", font=active_font, text_color="#ffffff")
+                else:
+                    btn.configure(fg_color="transparent", font=base_font, text_color=("gray10", "gray90"))
+            except Exception:
+                pass
+        for tk, g in getattr(self, "sidebar_gear_buttons", {}).items():
+            try:
+                if tk == cur:
+                    g.configure(fg_color="#2c5a8c")
+                else:
+                    g.configure(fg_color="#333333")
+            except Exception:
+                pass
 
     def _get_first_empty_task_key(self):
         """설정되지 않은 첫 번째 슬롯의 task_key"""
@@ -830,24 +1102,35 @@ class ModernMailSender(ctk.CTk):
         configured = self._get_configured_task_keys()
         self.task_key_to_index.clear()
         self.sidebar_buttons.clear()
+        self.sidebar_gear_buttons = {}
         for n, task_key in enumerate(configured, 1):
             self.task_key_to_index[task_key] = n
-            label = f"계정 {n}"
-            try:
-                with open(self.config_file, "r", encoding="utf-8") as f:
-                    d = json.load(f).get(task_key)
-                    if d and d.get("id"):
-                        label = f"계정 {n} ({d['id']})"
-            except Exception:
-                pass
+            label = self._sidebar_label_text(task_key, n)
+            row = ctk.CTkFrame(scrollable, fg_color="transparent")
+            row.pack(fill="x", pady=2)
             btn = ctk.CTkButton(
-                scrollable, text=label,
+                row,
+                text=label,
                 command=lambda tk=task_key: self._switch_profile(tk),
-                fg_color="transparent", anchor="w", height=36,
+                fg_color="transparent",
+                anchor="w",
+                height=36,
                 font=self._font_small,
             )
-            btn.pack(fill="x", pady=2)
+            btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+            btn.bind("<Button-3>", lambda e, tk=task_key: self._on_sidebar_account_right_click(e, tk))
             self.sidebar_buttons[task_key] = btn
+            gear = ctk.CTkButton(
+                row,
+                text="⚙",
+                width=32,
+                height=36,
+                fg_color="#333333",
+                font=self._font_small,
+            )
+            gear.configure(command=lambda tk=task_key, g=gear: self._open_account_manage_from_button(tk, g))
+            gear.pack(side="right")
+            self.sidebar_gear_buttons[task_key] = gear
         add_btn = ctk.CTkButton(
             scrollable, text="➕ 계정 추가",
             fg_color="#333", height=36, font=self._font_small,
@@ -855,6 +1138,7 @@ class ModernMailSender(ctk.CTk):
         )
         add_btn.pack(fill="x", pady=8)
         self.sidebar_add_btn = add_btn
+        self._highlight_active_sidebar()
 
     def _on_add_account_click(self):
         """계정 추가: 첫 번째 빈 슬롯으로 전환"""
@@ -876,18 +1160,11 @@ class ModernMailSender(ctk.CTk):
             self.sidebar_visible = True
 
     def _update_sidebar_label(self, task_key):
-        """사이드바 버튼 텍스트를 설정: 연동된 계정이 있으면 '계정 N (아이디)' 형태로 표시"""
+        """사이드바 버튼 텍스트를 설정: 별칭(display_name) 또는 '계정 N (아이디)'"""
         if task_key not in getattr(self, "sidebar_buttons", {}):
             return
         n = self.task_key_to_index.get(task_key, 0)
-        label = f"계정 {n}"
-        try:
-            with open(self.config_file, "r", encoding="utf-8") as f:
-                d = json.load(f).get(task_key)
-                if d and d.get("id"):
-                    label = f"계정 {n} ({d['id']})"
-        except Exception:
-            pass
+        label = self._sidebar_label_text(task_key, n)
         self.sidebar_buttons[task_key].configure(text=label)
 
     def _switch_profile(self, task_key):
@@ -896,6 +1173,7 @@ class ModernMailSender(ctk.CTk):
             self.profile_frames[self.current_profile].pack_forget()
         self.profile_frames[task_key].pack(fill="both", expand=True)
         self.current_profile = task_key
+        self._highlight_active_sidebar()
 
     def _open_user_profile_popup(self):
         """로그인 사용자 단일 프로필 편집 팝업."""
@@ -997,6 +1275,13 @@ class ModernMailSender(ctk.CTk):
         except Exception:
             pass
 
+        self._smtp_account_entries[task_key] = {
+            "e_id": e_id,
+            "e_pw": e_pw,
+            "e_smtp": e_smtp,
+            "e_port": e_port,
+        }
+
         def verify():
             uid, upw, usmtp, uport = e_id.get().strip(), e_pw.get().strip(), e_smtp.get().strip(), e_port.get().strip()
 
@@ -1005,17 +1290,20 @@ class ModernMailSender(ctk.CTk):
                     server = smtplib.SMTP_SSL(usmtp, int(uport), timeout=10)
                     server.login(uid, upw)
                     server.quit()
-                    with open(self.config_file, "r+", encoding="utf-8") as f:
-                        data = json.load(f)
-                        data[task_key] = {
-                            "id": uid,
-                            "pw": upw,
-                            "smtp": usmtp,
-                            "port": uport,
-                        }
-                        f.seek(0)
-                        json.dump(data, f, indent=4, ensure_ascii=False)
-                        f.truncate()
+                    data = self._read_full_config()
+                    prev = data.get(task_key) if isinstance(data.get(task_key), dict) else {}
+                    entry = {
+                        "id": uid,
+                        "pw": upw,
+                        "smtp": usmtp,
+                        "port": uport,
+                    }
+                    if isinstance(prev, dict):
+                        dn = (prev.get("display_name") or "").strip()
+                        if dn:
+                            entry["display_name"] = dn
+                    data[task_key] = entry
+                    self._atomic_write_config(data)
                     self.write_log(provider, idx, "✅ 계정 연동 성공")
                     self.after(0, self._rebuild_sidebar_buttons)
                 except Exception as e:
@@ -1212,6 +1500,83 @@ class ModernMailSender(ctk.CTk):
         send_f = ctk.CTkFrame(t3, fg_color="transparent")
         send_f.pack(fill="both", expand=True, padx=12, pady=8)
         cur_d = {"files": [], "imgs": {}}
+
+        # Phase 7 Task 7-2: 첨부/CID 요약 + 개별 삭제 목록(템플릿 로드 시 전체 초기화는 open_tpl_library에서 처리)
+        f_lbl = ctk.CTkLabel(send_f, text="📎 첨부: 없음", text_color="#95a5a6", font=self._font_small)
+        f_lbl.pack(anchor="w", pady=(0, 2))
+        files_list_inner = ctk.CTkScrollableFrame(send_f, height=84, fg_color="transparent")
+        files_list_inner.pack(fill="x", pady=(0, 6))
+        i_lbl = ctk.CTkLabel(send_f, text="🖼️ CID: 없음", text_color="#95a5a6", font=self._font_small)
+        i_lbl.pack(anchor="w", pady=(0, 2))
+        cid_list_inner = ctk.CTkScrollableFrame(send_f, height=84, fg_color="transparent")
+        cid_list_inner.pack(fill="x", pady=(0, 8))
+
+        def refresh_attach_ui():
+            for w in files_list_inner.winfo_children():
+                w.destroy()
+            for w in cid_list_inner.winfo_children():
+                w.destroy()
+            files = list(cur_d.get("files") or [])
+            imgs = cur_d.get("imgs") if isinstance(cur_d.get("imgs"), dict) else {}
+            cur_d["files"] = files
+            cur_d["imgs"] = imgs
+            nf, ni = len(files), len(imgs)
+            f_lbl.configure(text=f"📎 첨부: {nf}개" if nf else "📎 첨부: 없음")
+            i_lbl.configure(text=f"🖼️ CID: {ni}개" if ni else "🖼️ CID: 없음")
+            for i, path in enumerate(files):
+                row = ctk.CTkFrame(files_list_inner, fg_color="#2b2b2b", corner_radius=4)
+                row.pack(fill="x", pady=2, padx=2)
+                disp = os.path.basename(str(path)) or str(path)
+                ctk.CTkLabel(row, text=disp, anchor="w", font=self._font_small).pack(
+                    side="left", fill="x", expand=True, padx=(8, 4), pady=4
+                )
+
+                def _remove_file_at(idx=i):
+                    fl = list(cur_d.get("files") or [])
+                    if 0 <= idx < len(fl):
+                        fl.pop(idx)
+                        cur_d["files"] = fl
+                    refresh_attach_ui()
+
+                ctk.CTkButton(
+                    row,
+                    text="✕",
+                    width=32,
+                    height=28,
+                    fg_color="#c0392b",
+                    hover_color="#a93226",
+                    font=self._font_small,
+                    command=_remove_file_at,
+                ).pack(side="right", padx=4, pady=4)
+            for cid_name, cpath in list(imgs.items()):
+                row = ctk.CTkFrame(cid_list_inner, fg_color="#2b2b2b", corner_radius=4)
+                row.pack(fill="x", pady=2, padx=2)
+                c_disp = str(cid_name)
+                p_disp = os.path.basename(str(cpath)) or str(cpath)
+                ctk.CTkLabel(
+                    row,
+                    text=f"{c_disp}  →  {p_disp}",
+                    anchor="w",
+                    font=self._font_small,
+                ).pack(side="left", fill="x", expand=True, padx=(8, 4), pady=4)
+
+                def _remove_cid(cn=c_disp):
+                    im = cur_d.get("imgs")
+                    if isinstance(im, dict) and cn in im:
+                        im.pop(cn, None)
+                    refresh_attach_ui()
+
+                ctk.CTkButton(
+                    row,
+                    text="✕",
+                    width=32,
+                    height=28,
+                    fg_color="#c0392b",
+                    hover_color="#a93226",
+                    font=self._font_small,
+                    command=_remove_cid,
+                ).pack(side="right", padx=4, pady=4)
+
         toolbar = ctk.CTkFrame(send_f, fg_color="transparent")
         toolbar.pack(fill="x", pady=4)
         for c in range(8):
@@ -1223,7 +1588,9 @@ class ModernMailSender(ctk.CTk):
             width=88,
             height=32,
             font=self._font_small,
-            command=lambda: self.open_tpl_library(title_e, body_t, sender_e, cur_d, f_lbl, i_lbl),
+            command=lambda: self.open_tpl_library(
+                title_e, body_t, sender_e, cur_d, f_lbl, i_lbl, task_key, refresh_attach_ui
+            ),
         ).grid(row=0, column=0, padx=2, pady=2, sticky="w")
         ctk.CTkButton(
             toolbar,
@@ -1264,7 +1631,7 @@ class ModernMailSender(ctk.CTk):
             height=32,
             fg_color="#555",
             font=self._font_small,
-            command=lambda: self.attach_file(cur_d, f_lbl),
+            command=lambda: self.attach_file(cur_d, refresh_attach_ui),
         ).grid(row=0, column=6, padx=2, pady=2, sticky="e")
         ctk.CTkButton(
             toolbar,
@@ -1273,8 +1640,10 @@ class ModernMailSender(ctk.CTk):
             height=32,
             fg_color="#555",
             font=self._font_small,
-            command=lambda: self.attach_cid(cur_d, i_lbl),
+            command=lambda: self.attach_cid(cur_d, refresh_attach_ui),
         ).grid(row=0, column=7, padx=2, pady=2, sticky="e")
+
+        refresh_attach_ui()
 
         title_e = ctk.CTkEntry(send_f, placeholder_text="제목 {업체명}", height=38, font=self._font_body); title_e.pack(fill="x", pady=4)
         sender_e = ctk.CTkEntry(send_f, placeholder_text="보내는 사람 이름", height=38, border_color="#1F6AA5", font=self._font_body); sender_e.pack(fill="x", pady=4)
@@ -1326,7 +1695,7 @@ class ModernMailSender(ctk.CTk):
         dup_hint_f.pack(fill="x", pady=(0, 2))
         ctk.CTkLabel(
             dup_hint_f,
-            text="중복 차단: 같은 로그인 계정+같은 이메일+같은 템플릿만 스킵합니다.",
+            text="중복 차단: 같은 로그인 계정+같은 이메일+같은 본문(HTML 해시)이면 스킵합니다. (템플릿명이 같아도 본문을 바꾸면 발송 가능)",
             font=("맑은 고딕", 11),
             anchor="w",
             justify="left",
@@ -1418,8 +1787,6 @@ class ModernMailSender(ctk.CTk):
         stop_b = ctk.CTkButton(btn_f, text="🛑 중지", height=42, state="disabled", font=self._font_small, command=lambda: self.set_stop(task_key))
         stop_b.pack(side="right", fill="x", expand=True, padx=4)
 
-        f_lbl = ctk.CTkLabel(send_f, text="📎 첨부: 없음", text_color="#95a5a6", font=self._font_small); f_lbl.pack(anchor="w", pady=2)
-        i_lbl = ctk.CTkLabel(send_f, text="🖼️ CID: 없음", text_color="#95a5a6", font=self._font_small); i_lbl.pack(anchor="w", pady=2)
         log_t = ctk.CTkTextbox(send_f, height=72, font=("Consolas", 11), fg_color="#1e1e1e", text_color="#00ff00")
         log_t.pack(fill="x", pady=4)
         log_t.configure(state="disabled"); self.log_consoles[task_key] = log_t
@@ -1654,7 +2021,7 @@ class ModernMailSender(ctk.CTk):
                 self.write_log(p, i, "❌ 계정/수신처 부족")
                 return
 
-            # v2.7.0: 같은 로그인 아이디(account_id)+이메일+템플릿 스킵(과거 행은 표시명으로 하위 호환).
+            # v2.7.1: 같은 로그인 아이디+이메일+본문 HTML 해시로 스킵(로컬 DB). 템플릿명은 로그·시트용으로만 유지.
             actual_template = _dedup_template_key(template_name, title)
 
             # Phase 4: MIME 1건씩 조립→즉시 발송 (pre_composed 누적 제거). 스킵/간격은 기존과 동일.
@@ -1666,17 +2033,6 @@ class ModernMailSender(ctk.CTk):
                 email = row_data.get("이메일") or row_data.get("email", "")
                 no = idx
                 try:
-                    if prevent_dup:
-                        dup, dup_reason, _ = self.check_duplicate_send_status(
-                            email, actual_template
-                        )
-                        if dup and dup_reason == "same_template_same_sender":
-                            self.write_log(
-                                p,
-                                i,
-                                f"🚫 [{idx}/{len(all_rows)}] 스킵: {comp} (동일 계정·동일 템플릿 재발송) <{email}> 「{actual_template}」",
-                            )
-                            continue
                     if apply_public_filter and check_smart_filter(email, comp):
                         self.write_log(
                             p,
@@ -1688,6 +2044,19 @@ class ModernMailSender(ctk.CTk):
                         self.write_log(p, i, f"🚫 [{idx}/{len(all_rows)}] {comp} <{email}> 스킵(수신 거부 업체)")
                         continue
                     final_title, final_body = self._render_message_with_variables(key, title, body, row_data)
+                    body_html, _embedded_for_hash = self._process_body_html(final_body, comp)
+                    body_hash = _hash_body_html_sha256(body_html)
+                    if prevent_dup:
+                        dup, dup_reason, _ = self.check_duplicate_send_status(
+                            email, body_hash, actual_template
+                        )
+                        if dup and dup_reason in ("same_body_same_sender", "same_template_same_sender"):
+                            self.write_log(
+                                p,
+                                i,
+                                f"🚫 [{idx}/{len(all_rows)}] 스킵: {comp} (동일 계정·동일 본문 재발송) <{email}> 「{actual_template}」",
+                            )
+                            continue
                     msg = self._build_single_mime(config, s_name, email, final_title, final_body, data, comp)
                 except Exception as e:
                     self.write_log(p, i, f"❌ [{idx}/{len(all_rows)}] {comp} <{email}> MIME 조립 오류: {e}")
@@ -1708,7 +2077,9 @@ class ModernMailSender(ctk.CTk):
                         self.write_log(p, i, f"✅ [{idx}/{len(all_rows)}] {comp} <{email}> 성공")
                         self.update_last_sent_state(key, no, comp, email)
                         eff_tpl = self._effective_template_for_log(actual_template, final_title)
-                        self.record_success_to_db(key, p, i, comp, email, final_title, actual_template)
+                        self.record_success_to_db(
+                            key, p, i, comp, email, final_title, actual_template, content_hash=body_hash
+                        )
                         self.after(0, lambda c=comp, em=email, t=eff_tpl: self._append_cloud_sent_row(c, em, t))
                         self._update_stats_label()
                         lbl = self.progress_labels.get(key)
@@ -1758,7 +2129,7 @@ class ModernMailSender(ctk.CTk):
         con = sqlite3.connect(self.db_path)
         try:
             df = pd.read_sql_query(
-                "SELECT id, provider, account_idx as account, comp, email, subject, template_name, sent_at FROM sent_log WHERE task_key=? ORDER BY sent_at DESC",
+                "SELECT id, provider, account_idx as account, comp, email, subject, template_name, content_hash, sent_at FROM sent_log WHERE task_key=? ORDER BY sent_at DESC",
                 con,
                 params=(task_key,)
             )
@@ -2012,26 +2383,60 @@ class ModernMailSender(ctk.CTk):
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def attach_file(self, d, l):
-        ps = filedialog.askopenfilenames(); 
-        if ps: d["files"] = list(ps); l.configure(text=f"📎 첨부: {len(d['files'])}개")
-    def attach_cid(self, d, l):
-        p = filedialog.askopenfilename(); 
-        if p:
-            c = simpledialog.askstring("CID", "CID 이름:"); 
-            if c: d["imgs"][c] = p; l.configure(text=f"🖼️ CID: {len(d['imgs'])}개")
+    def attach_file(self, d, refresh=None):
+        """선택한 파일을 첨부 목록에 추가(기존 목록에 이어 붙임, 동일 경로는 제외)."""
+        ps = filedialog.askopenfilenames()
+        if not ps:
+            return
+        cur = list(d.get("files") or [])
+        seen = {os.path.normcase(os.path.abspath(str(x))) for x in cur}
+        for p in ps:
+            ap = os.path.abspath(str(p))
+            nc = os.path.normcase(ap)
+            if nc not in seen:
+                cur.append(p)
+                seen.add(nc)
+        d["files"] = cur
+        if callable(refresh):
+            refresh()
+
+    def attach_cid(self, d, refresh=None):
+        p = filedialog.askopenfilename()
+        if not p:
+            return
+        c = simpledialog.askstring("CID", "CID 이름:", parent=self)
+        if not c or not str(c).strip():
+            return
+        c = str(c).strip()
+        if not isinstance(d.get("imgs"), dict):
+            d["imgs"] = {}
+        d["imgs"][c] = p
+        if callable(refresh):
+            refresh()
 
     def save_tpl(self, t, b, s, d, task_key=None):
         n = simpledialog.askstring("저장", "템플릿 이름:"); 
         if n:
-            with open(self.template_file, 'r+', encoding='utf-8') as f:
-                data = json.load(f); data[n] = {"title": t.get(), "body": b.get("1.0", "end-1c"), "sender": s.get(), "files": d["files"], "imgs": d["imgs"]}
-                f.seek(0); json.dump(data, f, indent=4, ensure_ascii=False); f.truncate()
+            try:
+                with open(self.template_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data[n] = {
+                "title": t.get(),
+                "body": b.get("1.0", "end-1c"),
+                "sender": s.get(),
+                "files": list(d.get("files") or []),
+                "imgs": dict(d.get("imgs") or {}),
+            }
+            self._atomic_write_json_path(self.template_file, data, indent=4, ensure_ascii=False)
             messagebox.showinfo("완료", f"'{n}' 저장 성공")
             if task_key:
                 self.current_template_name[task_key] = n
 
-    def open_tpl_library(self, t, b, s, d, f_l, i_l):
+    def open_tpl_library(self, t, b, s, d, f_l, i_l, task_key_tpl, refresh_attach=None):
         pop = ctk.CTkToplevel(self)
         pop.title("템플릿")
         pop.geometry("320x420")
@@ -2050,18 +2455,38 @@ class ModernMailSender(ctk.CTk):
                 def apply(n=name):
                     with open(self.template_file, 'r', encoding='utf-8') as f:
                         tpl = json.load(f).get(n)
+                        if not tpl:
+                            messagebox.showerror("오류", "템플릿을 읽을 수 없습니다.", parent=pop)
+                            return
                         t.delete(0, 'end'); t.insert(0, tpl['title'])
                         b.delete("1.0", "end"); b.insert("1.0", tpl['body'])
                         s.delete(0, 'end'); s.insert(0, tpl.get('sender', ''))
-                        d["files"], d["imgs"] = tpl.get('files', []), tpl.get('imgs', {})
-                        f_l.configure(text=f"📎 첨부: {len(d['files'])}개"); i_l.configure(text=f"🖼️ CID: {len(d['imgs'])}개")
-                        self.current_template_name[task_key] = n
+                        d["files"] = []
+                        d["imgs"] = {}
+                        raw_files = tpl.get("files")
+                        raw_imgs = tpl.get("imgs")
+                        if isinstance(raw_files, list):
+                            d["files"] = [str(x) for x in raw_files]
+                        if isinstance(raw_imgs, dict):
+                            d["imgs"] = {str(k): str(v) for k, v in raw_imgs.items()}
+                        nf, ni = len(d["files"]), len(d["imgs"])
+                        f_l.configure(text=f"📎 첨부: {nf}개" if nf else "📎 첨부: 없음")
+                        i_l.configure(text=f"🖼️ CID: {ni}개" if ni else "🖼️ CID: 없음")
+                        if callable(refresh_attach):
+                            refresh_attach()
+                        self.current_template_name[task_key_tpl] = n
                     pop.destroy()
                 ctk.CTkButton(row, text=name, command=apply).pack(side="left", expand=True, fill="x", padx=1)
                 ctk.CTkButton(row, text="X", width=25, fg_color="red", command=lambda n=name: self.del_tpl(n, pop)).pack(side="right")
 
     def del_tpl(self, n, p):
         if messagebox.askyesno("삭제", f"'{n}' 삭제할까요?", parent=p):
-            with open(self.template_file, 'r+', encoding='utf-8') as f:
-                data = json.load(f); del data[n]; f.seek(0); json.dump(data, f, indent=4, ensure_ascii=False); f.truncate()
+            try:
+                with open(self.template_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+            if isinstance(data, dict) and n in data:
+                del data[n]
+                self._atomic_write_json_path(self.template_file, data, indent=4, ensure_ascii=False)
             p.destroy()

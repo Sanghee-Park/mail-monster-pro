@@ -1,5 +1,14 @@
 # MAIL MONSTER PRO 변경 이력
 
+## [v2.7.1] - 2026-04-21
+
+### Phase 7 — 계정 UX · 첨부/CID · 본문 해시 중복 차단 · 안정화
+- **계정 목록**: 별칭(`display_name`), 우클릭/⚙ 관리, 순서(`__account_order__`), 슬롯 삭제, 활성 행 강조. `config.json` 원자적 저장 유지.
+- **템플릿 로드**: 첨부·CID 전면 초기화 후 반영; 목록별 `✕` 삭제. `📎 파일`은 기존 목록에 경로 추가(중복 제외).
+- **중복 차단**: 로컬 `sent_log.content_hash`(MIME용 HTML의 SHA256) 기준. 시트 발송내역 연동 코드는 변경 없음. 구 `content_hash` 없는 행은 본문 해시 비교에서 제외.
+- **Task 7-4**: `templates.json` / `recipients.json` / `user_profiles.json` 저장도 임시 파일+`os.replace`로 원자적 저장. 계정 컨텍스트 메뉴 `destroy()`로 정리.
+- **버전**: `login.py` / `main_ui.py` 폴백 / Inno `MyAppVersion` → `v2.7.1` / `2.7.1`.
+
 ## [v2.7.0] - 2026-03-29
 
 ### 중복 차단: 로그인 아이디(계정) 기준

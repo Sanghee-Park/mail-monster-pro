@@ -912,25 +912,39 @@ class ModernMailSender(ctk.CTk):
             return f"계정 {index_n} ({login_id})"
         return f"계정 {index_n}"
 
+    def _safe_destroy_tk_menu(self, menu):
+        """tk.Menu는 tk_popup 직후 destroy 하면 command(다이얼로그 등)가 먹통이 될 수 있어 지연 파기."""
+        try:
+            if menu is not None and menu.winfo_exists():
+                menu.destroy()
+        except Exception:
+            pass
+
     def _popup_account_context_menu(self, task_key, x_root, y_root):
-        menu = Menu(self, tearoff=0)
-        menu.add_command(
-            label="표시 이름(별칭) 변경…",
-            command=lambda: self._rename_account_display(task_key),
-        )
-        menu.add_command(
-            label="위로 이동",
-            command=lambda: self._move_account_in_sidebar(task_key, -1),
-        )
-        menu.add_command(
-            label="아래로 이동",
-            command=lambda: self._move_account_in_sidebar(task_key, 1),
-        )
+        # CTk 창의 Tk 계층에 붙임(일부 환경에서 Menu(self)만으로 command 미동작 방지)
+        try:
+            tk_host = self.winfo_toplevel()
+        except Exception:
+            tk_host = self
+        menu = Menu(tk_host, tearoff=0)
+
+        def _do_rename(tk=task_key):
+            self._rename_account_display(tk)
+
+        def _do_up(tk=task_key):
+            self._move_account_in_sidebar(tk, -1)
+
+        def _do_down(tk=task_key):
+            self._move_account_in_sidebar(tk, 1)
+
+        def _do_delete(tk=task_key):
+            self._delete_account_slot(tk)
+
+        menu.add_command(label="표시 이름(별칭) 변경…", command=_do_rename)
+        menu.add_command(label="위로 이동", command=_do_up)
+        menu.add_command(label="아래로 이동", command=_do_down)
         menu.add_separator()
-        menu.add_command(
-            label="이 슬롯 계정 삭제…",
-            command=lambda: self._delete_account_slot(task_key),
-        )
+        menu.add_command(label="이 슬롯 계정 삭제…", command=_do_delete)
         try:
             menu.tk_popup(int(x_root), int(y_root))
         finally:
@@ -938,10 +952,8 @@ class ModernMailSender(ctk.CTk):
                 menu.grab_release()
             except Exception:
                 pass
-            try:
-                menu.destroy()
-            except Exception:
-                pass
+        # command·다이얼로그가 끝난 뒤 파기 (finally 안에서 즉시 destroy 금지)
+        self.after(300, lambda m=menu: self._safe_destroy_tk_menu(m))
 
     def _on_sidebar_account_right_click(self, event, task_key):
         self._popup_account_context_menu(task_key, event.x_root, event.y_root)
@@ -978,6 +990,7 @@ class ModernMailSender(ctk.CTk):
         cfg[task_key] = ent
         self._atomic_write_config(cfg)
         self._rebuild_sidebar_buttons()
+        self._highlight_active_sidebar()
 
     def _move_account_in_sidebar(self, task_key, delta):
         keys = self._get_configured_task_keys()
@@ -993,6 +1006,7 @@ class ModernMailSender(ctk.CTk):
         cfg[CONFIG_META_ACCOUNT_ORDER_KEY] = lst
         self._atomic_write_config(cfg)
         self._rebuild_sidebar_buttons()
+        self._highlight_active_sidebar()
 
     def _clear_account_ui_data(self, task_key):
         w = self._smtp_account_entries.get(task_key)
@@ -1497,19 +1511,23 @@ class ModernMailSender(ctk.CTk):
                         pass
             update_count_label()
 
-        send_f = ctk.CTkFrame(t3, fg_color="transparent")
-        send_f.pack(fill="both", expand=True, padx=12, pady=8)
+        # 메시지 탭 전체 스크롤: 첨부/CID·배너 등으로 하단 버튼이 밀리지 않도록
+        t3_scroll = ctk.CTkScrollableFrame(t3, fg_color="transparent")
+        t3_scroll.pack(fill="both", expand=True, padx=0, pady=0)
+        send_f = ctk.CTkFrame(t3_scroll, fg_color="transparent")
+        send_f.pack(fill="x", expand=True, padx=8, pady=6)
         cur_d = {"files": [], "imgs": {}}
 
-        # Phase 7 Task 7-2: 첨부/CID 요약 + 개별 삭제 목록(템플릿 로드 시 전체 초기화는 open_tpl_library에서 처리)
+        # Phase 7 Task 7-2: 첨부/CID 요약 + 개별 삭제(높이는 3~4줄 분량으로 제한, 나머지는 스크롤)
+        _attach_list_h = 56
         f_lbl = ctk.CTkLabel(send_f, text="📎 첨부: 없음", text_color="#95a5a6", font=self._font_small)
         f_lbl.pack(anchor="w", pady=(0, 2))
-        files_list_inner = ctk.CTkScrollableFrame(send_f, height=84, fg_color="transparent")
-        files_list_inner.pack(fill="x", pady=(0, 6))
+        files_list_inner = ctk.CTkScrollableFrame(send_f, height=_attach_list_h, fg_color="transparent")
+        files_list_inner.pack(fill="x", pady=(0, 4))
         i_lbl = ctk.CTkLabel(send_f, text="🖼️ CID: 없음", text_color="#95a5a6", font=self._font_small)
         i_lbl.pack(anchor="w", pady=(0, 2))
-        cid_list_inner = ctk.CTkScrollableFrame(send_f, height=84, fg_color="transparent")
-        cid_list_inner.pack(fill="x", pady=(0, 8))
+        cid_list_inner = ctk.CTkScrollableFrame(send_f, height=_attach_list_h, fg_color="transparent")
+        cid_list_inner.pack(fill="x", pady=(0, 6))
 
         def refresh_attach_ui():
             for w in files_list_inner.winfo_children():

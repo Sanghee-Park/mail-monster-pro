@@ -37,6 +37,8 @@ Desktop.ini
 메일몬스터 신규버전/
 
 # --- 기타 ---
+# 프로젝트 루트에 복사해 둔 빌드 산출물(실제 배포는 dist/)
+MAIL_MONSTER_PRO.exe
 *.log
 .cursor/
 *.zip

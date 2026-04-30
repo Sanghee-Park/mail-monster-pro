@@ -74,6 +74,22 @@ def _hash_body_html_sha256(body_html: str) -> str:
     return hashlib.sha256((body_html or "").encode("utf-8")).hexdigest()
 
 
+_EMAIL_EXTRACT_RE = re.compile(r"[^@\s<>,;]+@[^@\s<>,;]+\.[^@\s<>,;]+")
+
+
+def _extract_emails(text: str):
+    """수신처 셀의 잡다한 문자열에서 이메일들을 추출.
+    예) '홍길동 <A@EX.com>; b@y.com' -> ['A@EX.com', 'b@y.com']
+    """
+    s = str(text or "").strip()
+    if not s:
+        return []
+    try:
+        return _EMAIL_EXTRACT_RE.findall(s)
+    except Exception:
+        return []
+
+
 def _dedup_template_key(template_name, title_fallback=""):
     """Task 2-2: 중복 검사·sent_log에 기록하는 템플릿 키. 저장된 템플릿명 우선, 없으면 제목. 양쪽 strip()."""
     tn = (template_name or "").strip()
@@ -556,19 +572,54 @@ class ModernMailSender(ctk.CTk):
 
     def _is_blacklisted(self, email):
         """이메일이 블랙리스트에 있는지 확인 (Task 5-1)"""
-        e = (email or "").strip()
-        if not e:
+        e_raw = (email or "").strip()
+        if not e_raw:
             return False
+        candidates = _extract_emails(e_raw) or [e_raw]
         con = sqlite3.connect(self.db_path)
         try:
-            cur = con.execute("SELECT 1 FROM blacklist WHERE email=? COLLATE NOCASE LIMIT 1", (e,))
-            return cur.fetchone() is not None
+            for e in candidates:
+                e = (e or "").strip()
+                if not e:
+                    continue
+                cur = con.execute(
+                    "SELECT 1 FROM blacklist WHERE email=? COLLATE NOCASE LIMIT 1", (e,)
+                )
+                if cur.fetchone() is not None:
+                    return True
+            return False
+        finally:
+            con.close()
+
+    def _is_blacklisted_detail(self, email):
+        """블랙리스트 매칭 상세(매칭된 이메일/사유) — UI 로그용."""
+        e_raw = (email or "").strip()
+        if not e_raw:
+            return False, None, None
+        candidates = _extract_emails(e_raw) or [e_raw]
+        con = sqlite3.connect(self.db_path)
+        try:
+            for e in candidates:
+                e = (e or "").strip()
+                if not e:
+                    continue
+                cur = con.execute(
+                    "SELECT reason FROM blacklist WHERE email=? COLLATE NOCASE LIMIT 1",
+                    (e,),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    reason = (row[0] or "").strip() if len(row) else ""
+                    return True, e, reason
+            return False, None, None
         finally:
             con.close()
 
     def _add_blacklist(self, email, comp="", reason=""):
         """블랙리스트에 이메일 추가 (Task 5-1)"""
-        e = (email or "").strip()
+        e_raw = (email or "").strip()
+        e_list = _extract_emails(e_raw)
+        e = (e_list[0] if e_list else e_raw).strip()
         if not e:
             return False
         con = sqlite3.connect(self.db_path)
@@ -586,7 +637,9 @@ class ModernMailSender(ctk.CTk):
 
     def _remove_blacklist(self, email):
         """블랙리스트에서 이메일 제거 (Task 5-1)"""
-        e = (email or "").strip()
+        e_raw = (email or "").strip()
+        e_list = _extract_emails(e_raw)
+        e = (e_list[0] if e_list else e_raw).strip()
         if not e:
             return False
         con = sqlite3.connect(self.db_path)
@@ -2058,8 +2111,14 @@ class ModernMailSender(ctk.CTk):
                             f"🚫 [{idx}/{len(all_rows)}] 필터링: {comp} <{email}> (공공/단체 규칙 일치로 스킵됨)",
                         )
                         continue
-                    if self._is_blacklisted(email):
-                        self.write_log(p, i, f"🚫 [{idx}/{len(all_rows)}] {comp} <{email}> 스킵(수신 거부 업체)")
+                    bl, bl_email, bl_reason = self._is_blacklisted_detail(email)
+                    if bl:
+                        reason_txt = f" / 사유: {bl_reason}" if bl_reason else ""
+                        self.write_log(
+                            p,
+                            i,
+                            f"🚫 [{idx}/{len(all_rows)}] {comp} <{email}> 스킵(수신 거부: {bl_email}{reason_txt})",
+                        )
                         continue
                     final_title, final_body = self._render_message_with_variables(key, title, body, row_data)
                     body_html, _embedded_for_hash = self._process_body_html(final_body, comp)

@@ -46,7 +46,7 @@ LOG_CONSOLE_MAX_LINES = 1000
 _SMART_FILTER_DOMAIN_SUFFIXES = (".go.kr", ".or.kr", ".re.kr", ".ac.kr", ".mil.kr")
 _SMART_FILTER_COMPANY_KEYWORDS = ("협회", "학회", "조합", "중앙회", "공사", "공단", "재단")
 
-# Phase 7 (v2.7.1): config.json 루트 메타 — 사이드바에 나열할 task_key 순서
+# Phase 8 (v2.7.2): config.json 루트 메타 — 사이드바에 나열할 task_key 순서
 CONFIG_META_ACCOUNT_ORDER_KEY = "__account_order__"
 
 
@@ -88,6 +88,51 @@ def _extract_emails(text: str):
         return _EMAIL_EXTRACT_RE.findall(s)
     except Exception:
         return []
+
+
+def _norm_str(v):
+    """Phase 8: 비교 전 문자열 정규화(공백/대소문자 이슈 제거)."""
+    return str(v or "").strip().lower()
+
+
+def _is_domain_blacklist_token(token_norm: str):
+    """블랙리스트 토큰이 도메인 규칙인지 판별."""
+    t = _norm_str(token_norm)
+    if not t:
+        return False
+    if t.startswith("@"):
+        return True
+    if t.startswith("*."):
+        return True
+    # 이메일 전체가 아닌 도메인만 적은 케이스(예: spam.com)
+    return "@" not in t and "." in t
+
+
+def _match_blacklist_token(email_norm: str, token_norm: str):
+    """Phase 8: 이메일 vs 블랙리스트 토큰 매칭.
+    - 정확 이메일 매칭
+    - 도메인 규칙(@spam.com / spam.com / *.spam.com) endswith 매칭
+    """
+    e = _norm_str(email_norm)
+    t = _norm_str(token_norm)
+    if not e or not t:
+        return False
+    if "@" not in e:
+        return False
+
+    # 정확 이메일 매칭
+    if not _is_domain_blacklist_token(t):
+        return e == t
+
+    # 도메인 규칙 매칭
+    if t.startswith("@"):
+        dom = t[1:]
+        return e.endswith("@" + dom) or e.endswith("." + dom)
+    if t.startswith("*."):
+        dom = t[2:]
+        return e.endswith("." + dom) or e.endswith("@" + dom)
+    # "spam.com" 형태
+    return e.endswith("@" + t) or e.endswith("." + t)
 
 
 def _dedup_template_key(template_name, title_fallback=""):
@@ -140,7 +185,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.7.1"
+            CURRENT_VERSION = "v2.7.2"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686")  # 기본 크기
         self.minsize(800, 520)  # 축소 시 레이아웃 붕괴·버튼 소실 방지
@@ -572,45 +617,31 @@ class ModernMailSender(ctk.CTk):
 
     def _is_blacklisted(self, email):
         """이메일이 블랙리스트에 있는지 확인 (Task 5-1)"""
-        e_raw = (email or "").strip()
-        if not e_raw:
-            return False
-        candidates = _extract_emails(e_raw) or [e_raw]
-        con = sqlite3.connect(self.db_path)
-        try:
-            for e in candidates:
-                e = (e or "").strip()
-                if not e:
-                    continue
-                cur = con.execute(
-                    "SELECT 1 FROM blacklist WHERE email=? COLLATE NOCASE LIMIT 1", (e,)
-                )
-                if cur.fetchone() is not None:
-                    return True
-            return False
-        finally:
-            con.close()
+        ok, _, _ = self._is_blacklisted_detail(email)
+        return ok
 
     def _is_blacklisted_detail(self, email):
-        """블랙리스트 매칭 상세(매칭된 이메일/사유) — UI 로그용."""
+        """Phase 8: 블랙리스트 매칭 상세(매칭값/사유).
+        비교는 반드시 양쪽 strip().lower() 기준으로 수행.
+        """
         e_raw = (email or "").strip()
         if not e_raw:
             return False, None, None
-        candidates = _extract_emails(e_raw) or [e_raw]
+        candidates_raw = _extract_emails(e_raw) or [e_raw]
+        candidates = [_norm_str(x) for x in candidates_raw if _norm_str(x)]
+        if not candidates:
+            return False, None, None
         con = sqlite3.connect(self.db_path)
         try:
-            for e in candidates:
-                e = (e or "").strip()
-                if not e:
+            rows = con.execute("SELECT email, reason FROM blacklist").fetchall()
+            for bl_email_raw, bl_reason in rows:
+                bl_token = _norm_str(bl_email_raw)
+                if not bl_token:
                     continue
-                cur = con.execute(
-                    "SELECT reason FROM blacklist WHERE email=? COLLATE NOCASE LIMIT 1",
-                    (e,),
-                )
-                row = cur.fetchone()
-                if row is not None:
-                    reason = (row[0] or "").strip() if len(row) else ""
-                    return True, e, reason
+                for e in candidates:
+                    if _match_blacklist_token(e, bl_token):
+                        reason = _norm_str(bl_reason)
+                        return True, bl_token, reason
             return False, None, None
         finally:
             con.close()
@@ -619,7 +650,7 @@ class ModernMailSender(ctk.CTk):
         """블랙리스트에 이메일 추가 (Task 5-1)"""
         e_raw = (email or "").strip()
         e_list = _extract_emails(e_raw)
-        e = (e_list[0] if e_list else e_raw).strip()
+        e = _norm_str(e_list[0] if e_list else e_raw)
         if not e:
             return False
         con = sqlite3.connect(self.db_path)
@@ -639,12 +670,15 @@ class ModernMailSender(ctk.CTk):
         """블랙리스트에서 이메일 제거 (Task 5-1)"""
         e_raw = (email or "").strip()
         e_list = _extract_emails(e_raw)
-        e = (e_list[0] if e_list else e_raw).strip()
+        e = _norm_str(e_list[0] if e_list else e_raw)
         if not e:
             return False
         con = sqlite3.connect(self.db_path)
         try:
-            con.execute("DELETE FROM blacklist WHERE email=? COLLATE NOCASE", (e,))
+            con.execute(
+                "DELETE FROM blacklist WHERE LOWER(TRIM(COALESCE(email,'')))=?",
+                (e,),
+            )
             con.commit()
             return True
         except Exception:
@@ -767,7 +801,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.7.1"
+            _ver = "v2.7.2"
 
         title_lbl = ctk.CTkLabel(
             header,
@@ -2092,7 +2126,7 @@ class ModernMailSender(ctk.CTk):
                 self.write_log(p, i, "❌ 계정/수신처 부족")
                 return
 
-            # v2.7.1: 같은 로그인 아이디+이메일+본문 HTML 해시로 스킵(로컬 DB). 템플릿명은 로그·시트용으로만 유지.
+            # v2.7.2: 같은 로그인 아이디+이메일+본문 HTML 해시로 스킵(로컬 DB). 템플릿명은 로그·시트용으로만 유지.
             actual_template = _dedup_template_key(template_name, title)
 
             # Phase 4: MIME 1건씩 조립→즉시 발송 (pre_composed 누적 제거). 스킵/간격은 기존과 동일.
@@ -2111,13 +2145,14 @@ class ModernMailSender(ctk.CTk):
                             f"🚫 [{idx}/{len(all_rows)}] 필터링: {comp} <{email}> (공공/단체 규칙 일치로 스킵됨)",
                         )
                         continue
+                    # Phase 8: 블랙리스트 검사는 반드시 MIME 조립/발송 전 선행.
                     bl, bl_email, bl_reason = self._is_blacklisted_detail(email)
                     if bl:
                         reason_txt = f" / 사유: {bl_reason}" if bl_reason else ""
                         self.write_log(
                             p,
                             i,
-                            f"🚫 [{idx}/{len(all_rows)}] {comp} <{email}> 스킵(수신 거부: {bl_email}{reason_txt})",
+                            f"🚫 [{idx}/{len(all_rows)}] 스킵: {comp} (블랙리스트 차단) <{email}> [매칭: {bl_email}{reason_txt}]",
                         )
                         continue
                     final_title, final_body = self._render_message_with_variables(key, title, body, row_data)

@@ -185,7 +185,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.7.2"
+            CURRENT_VERSION = "v2.7.3"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686")  # 기본 크기
         self.minsize(800, 520)  # 축소 시 레이아웃 붕괴·버튼 소실 방지
@@ -801,7 +801,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.7.2"
+            _ver = "v2.7.3"
 
         title_lbl = ctk.CTkLabel(
             header,
@@ -1337,6 +1337,31 @@ class ModernMailSender(ctk.CTk):
         setup_box.pack(fill="x", expand=True)
         _e = {"height": 38, "font": self._font_body}
         ctk.CTkLabel(setup_box, text="SMTP 계정", font=self._font_title).pack(anchor="w", pady=(0, 4))
+
+        # Phase 9 (v2.7.3): 인증 방식 선택 — 일반 SMTP(구버전) / 분리형 인증(Amazon SES 등)
+        auth_type_var = ctk.StringVar(value="standard")
+        auth_box = ctk.CTkFrame(setup_box, fg_color="#252525", corner_radius=8)
+        auth_box.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(auth_box, text="인증 방식", font=("맑은 고딕", 11, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
+        ctk.CTkRadioButton(
+            auth_box,
+            text="일반 SMTP (구 버전: 로그인 아이디 = 보내는 주소)",
+            variable=auth_type_var,
+            value="standard",
+            font=("맑은 고딕", 11),
+            command=lambda: _on_auth_type_change(),
+        ).pack(anchor="w", padx=12, pady=2)
+        ctk.CTkRadioButton(
+            auth_box,
+            text="분리형 인증 (신 버전: Amazon SES 등 / 로그인 ID ≠ From)",
+            variable=auth_type_var,
+            value="separated",
+            font=("맑은 고딕", 11),
+            command=lambda: _on_auth_type_change(),
+        ).pack(anchor="w", padx=12, pady=(2, 8))
+
+        id_label = ctk.CTkLabel(setup_box, text="아이디", font=("맑은 고딕", 10), text_color="#95a5a6")
+        id_label.pack(anchor="w", pady=(0, 0))
         e_id = ctk.CTkEntry(setup_box, placeholder_text="아이디", **_e)
         e_id.pack(fill="x", pady=5)
         e_pw = ctk.CTkEntry(setup_box, placeholder_text="앱 비밀번호", show="*", **_e)
@@ -1345,6 +1370,31 @@ class ModernMailSender(ctk.CTk):
         e_smtp.pack(fill="x", pady=5)
         e_port = ctk.CTkEntry(setup_box, placeholder_text="포트 (465)", **_e)
         e_port.pack(fill="x", pady=5)
+
+        # 분리형 인증에서만 노출되는 '보내는 사람 주소 (From)' 영역
+        from_frame = ctk.CTkFrame(setup_box, fg_color="transparent")
+        from_label = ctk.CTkLabel(
+            from_frame,
+            text="보내는 사람 주소 (From) — 수신자에게 보일 실제 주소",
+            font=("맑은 고딕", 10),
+            text_color="#f1c40f",
+        )
+        from_label.pack(anchor="w", pady=(0, 0))
+        e_from = ctk.CTkEntry(from_frame, placeholder_text="예: noreply@yourdomain.com", **_e)
+        e_from.pack(fill="x", pady=5)
+
+        def _on_auth_type_change():
+            if auth_type_var.get() == "separated":
+                id_label.configure(text="SMTP 로그인 아이디 (AKIA...)")
+                e_id.configure(placeholder_text="SMTP 로그인 아이디 (AKIA...)")
+                try:
+                    from_frame.pack(fill="x", pady=(2, 4), after=e_port)
+                except Exception:
+                    from_frame.pack(fill="x", pady=(2, 4))
+            else:
+                id_label.configure(text="아이디")
+                e_id.configure(placeholder_text="아이디")
+                from_frame.pack_forget()
         ctk.CTkLabel(
             setup_box,
             text="발송자 정보는 로그인 사용자 기준으로 공통 사용됩니다.",
@@ -1373,18 +1423,49 @@ class ModernMailSender(ctk.CTk):
                         e_smtp.insert(0, d["smtp"])
                     if d.get("port"):
                         e_port.insert(0, str(d["port"]))
+                    # Phase 9: 하위호환 — auth_type 없으면 standard로 인식
+                    _auth = (d.get("auth_type") or "standard").strip().lower()
+                    if _auth not in ("standard", "separated"):
+                        _auth = "standard"
+                    auth_type_var.set(_auth)
+                    if d.get("sender_email"):
+                        e_from.insert(0, str(d["sender_email"]))
         except Exception:
             pass
+
+        _on_auth_type_change()
 
         self._smtp_account_entries[task_key] = {
             "e_id": e_id,
             "e_pw": e_pw,
             "e_smtp": e_smtp,
             "e_port": e_port,
+            "e_from": e_from,
+            "auth_type_var": auth_type_var,
         }
 
         def verify():
             uid, upw, usmtp, uport = e_id.get().strip(), e_pw.get().strip(), e_smtp.get().strip(), e_port.get().strip()
+            auth_type = auth_type_var.get().strip().lower()
+            if auth_type not in ("standard", "separated"):
+                auth_type = "standard"
+            sender_email = e_from.get().strip()
+
+            # Task 9-4: 분리형 인증인데 보내는 사람 주소가 비어 있으면 저장 차단
+            if auth_type == "separated" and not sender_email:
+                messagebox.showwarning(
+                    "입력 확인",
+                    "분리형 인증에서는 '보내는 사람 주소 (From)'를 반드시 입력해야 합니다.",
+                    parent=self,
+                )
+                return
+            if auth_type == "separated" and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", sender_email):
+                messagebox.showwarning(
+                    "입력 확인",
+                    "보내는 사람 주소 (From) 형식이 올바르지 않습니다.\n예: noreply@yourdomain.com",
+                    parent=self,
+                )
+                return
 
             def check():
                 try:
@@ -1398,7 +1479,10 @@ class ModernMailSender(ctk.CTk):
                         "pw": upw,
                         "smtp": usmtp,
                         "port": uport,
+                        "auth_type": auth_type,
                     }
+                    if auth_type == "separated":
+                        entry["sender_email"] = sender_email
                     if isinstance(prev, dict):
                         dn = (prev.get("display_name") or "").strip()
                         if dn:
@@ -2345,10 +2429,24 @@ class ModernMailSender(ctk.CTk):
         new_html = re.sub(r'src=["\'](data:image/[^"\']+)["\']', _replace, html, flags=re.I)
         return new_html, embedded
 
+    def _resolve_from_address(self, config):
+        """Phase 9 (v2.7.3): auth_type에 따라 msg['From']에 쓸 발신 주소를 결정.
+        - standard(구버전): 로그인 아이디(config['id'])를 그대로 From 주소로 사용.
+        - separated(신버전, Amazon SES 등): sender_email을 From 주소로 사용.
+        하위호환: auth_type 키가 없으면 standard로 간주.
+        로그인(server.login)은 항상 config['id']/config['pw']를 사용하므로 별도 처리한다.
+        """
+        auth_type = str((config or {}).get("auth_type", "standard") or "standard").strip().lower()
+        if auth_type == "separated":
+            sender_email = str((config or {}).get("sender_email", "") or "").strip()
+            if sender_email:
+                return sender_email
+        return config.get("id", "")
+
     def _build_single_mime(self, config, s_name, to_email, final_title, final_body, data, comp):
         """서버 접속 없이 MIME 메시지 1통 조립. `real_engine`에서 1건씩 조립 후 즉시 발송."""
         msg = MIMEMultipart()
-        msg['From'] = formataddr((str(Header(s_name or "운영사무국", 'utf-8')), config['id']))
+        msg['From'] = formataddr((str(Header(s_name or "운영사무국", 'utf-8')), self._resolve_from_address(config)))
         msg['To'] = to_email
         msg['Subject'] = Header(final_title, 'utf-8')
         body_html, embedded_imgs = self._process_body_html(final_body, comp)
@@ -2461,7 +2559,7 @@ class ModernMailSender(ctk.CTk):
                 final_title, final_body = self._render_message_with_variables(key, title, body, sample_row)
 
                 msg = MIMEMultipart()
-                msg['From'] = formataddr((str(Header(resolved_sender_name or "운영사무국", 'utf-8')), config['id']))
+                msg['From'] = formataddr((str(Header(resolved_sender_name or "운영사무국", 'utf-8')), self._resolve_from_address(config)))
                 msg['To'] = to_email
                 msg['Subject'] = Header(final_title, 'utf-8')
 

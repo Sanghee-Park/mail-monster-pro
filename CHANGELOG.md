@@ -1,5 +1,17 @@
 # MAIL MONSTER PRO 변경 이력
 
+## [v2.7.3] - 2026-06-16
+
+### Phase 9 — Amazon SES 및 분리형 인증 방식 지원
+- **인증 방식 선택 UI (Task 9-1)**: [계정 설정]에 `인증 방식` 라디오 버튼 추가.
+  - `일반 SMTP (구 버전: 로그인 아이디 = 보내는 주소)` (기본값)
+  - `분리형 인증 (신 버전: Amazon SES 등 / 로그인 ID ≠ From)`
+  - 분리형 선택 시에만 **[보내는 사람 주소 (From)]** 입력 칸이 동적으로 노출되며, 아이디 라벨/플레이스홀더가 `SMTP 로그인 아이디 (AKIA...)`로 전환.
+- **저장·하위호환 (Task 9-2)**: `config.json` 계정 정보에 `auth_type`("standard"/"separated")과 `sender_email` 키 분리 저장. 기존 계정은 `auth_type`이 없으면 자동으로 "standard"로 인식(`dict.get('auth_type','standard')` 폴백)하여 네이버/다음 등 기존 계정 호환성 완전 보장.
+- **발송 봉투 분기 (Task 9-3)**: SMTP 로그인(`server.login`)은 항상 로그인 아이디(`config['id']`/`pw`)를 사용. `msg['From']`은 `_resolve_from_address()`로 분기 — standard는 로그인 아이디, separated는 `sender_email`을 발신 주소로 사용. `_build_single_mime`(실발송)·테스트 발송 모두 적용.
+- **유효성 검사 (Task 9-4)**: 분리형 인증 선택 시 보내는 사람 주소가 비어 있거나 이메일 형식이 아니면 경고창을 띄우고 저장을 차단.
+- **버전**: `login.py` / `main_ui.py` 폴백 / Inno `MyAppVersion` → `v2.7.3` / `2.7.3`.
+
 ## [v2.7.2] - 2026-05-06
 
 ### Phase 8 — 블랙리스트(수신거부) 필터링 누수 긴급 패치

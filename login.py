@@ -15,7 +15,7 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Phase 8 Task 8-x: 구글 시트 버전과 비교할 앱 현재 버전
-CURRENT_VERSION = "v2.7.2"
+CURRENT_VERSION = "v2.7.3"
 SPREADSHEET_KEY = "1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw"
 
 # GitHub 릴리스 연동: 시트 B1이 비어 있거나 "GITHUB"이면 최신 Release의 .exe URL 사용 (구글 드라이브 불필요)

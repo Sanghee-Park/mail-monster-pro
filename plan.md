@@ -103,3 +103,12 @@
   - 로드 시 `auth_type` 폴백("standard")·`sender_email` 복원, 저장 시 `auth_type`/`sender_email` 분리 저장.
   - `_resolve_from_address(config)`: auth_type 분기로 `msg['From']` 주소 결정. `_build_single_mime()`·테스트 발송에 적용. 로그인은 항상 `config['id']`.
 - **버전 동기화**: `login.py` / `main_ui.py` 폴백 / Inno `MyAppVersion` / `package_and_deploy.ps1` → v2.7.3, `CHANGELOG.md` 기록.
+
+---
+
+## Phase 10: 대한민국 영업일 자동발송 창 (v2.8.0)
+
+- KST 09:00~18:00, 주말/공휴일/대체공휴일/근로자의 날/수동 휴무일 제외.
+- `scheduled_pause` vs `user_stopped` 구분, SQLite `campaign_jobs`/`campaign_queue` 영속 대기열.
+- Windows Run 키 자동복구 + 단일 인스턴스 mutex.
+- 테스트: `python -m unittest discover -s tests -v`

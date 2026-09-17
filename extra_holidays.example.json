@@ -1,0 +1,7 @@
+{
+  "dates": ["2026-10-02"],
+  "notes": {
+    "2026-10-02": "예시 임시공휴일 — 이 파일은 읽기 전용입니다."
+  },
+  "description": "이 파일(extra_holidays.example.json)은 읽기 전용 예시입니다. 실제 휴무일은 extra_holidays.json에 같은 형식으로 작성하세요. extra_holidays.json은 프로그램이 쓸 수 있는 폴더(설치 폴더 또는 %LOCALAPPDATA%\\MAIL_MONSTER_PRO)에 생성됩니다."
+}

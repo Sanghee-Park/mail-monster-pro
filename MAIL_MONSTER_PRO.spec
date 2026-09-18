@@ -4,6 +4,12 @@
 
 import os
 
+try:
+    from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+except Exception:
+    collect_data_files = None
+    collect_submodules = None
+
 BASE = os.path.abspath('.')
 
 # 실행 파일과 함께 복사할 데이터 파일
@@ -12,6 +18,49 @@ datas = [
 ]
 if os.path.exists(os.path.join(BASE, 'pro.ico')):
     datas.append(('pro.ico', '.'))
+if os.path.exists(os.path.join(BASE, 'extra_holidays.example.json')):
+    datas.append(('extra_holidays.example.json', '.'))
+
+if collect_data_files:
+    for pkg in ("tzdata", "holidays"):
+        try:
+            datas += collect_data_files(pkg)
+        except Exception:
+            pass
+
+hiddenimports = [
+    'customtkinter',
+    'PIL',
+    'PIL._tkinter_finder',
+    'pystray',
+    'pystray._win32',
+    'login',
+    'main_ui',
+    'blacklist_manager',
+    'business_hours',
+    'campaign_store',
+    'campaign_runtime',
+    'app_paths',
+    'version_compare',
+    'smtp_credentials',
+    'ui_safe',
+    'login_network',
+    'campaign_attachments',
+    'campaign_attention',
+    'data_migrate',
+    'holidays',
+    'tzdata',
+    'zoneinfo',
+    'gspread',
+    'google.auth',
+    'requests',
+]
+if collect_submodules:
+    for pkg in ("holidays", "tzdata"):
+        try:
+            hiddenimports += collect_submodules(pkg)
+        except Exception:
+            pass
 
 # 로그인/크레덴셜 등은 실행 시 생성되므로 제외. 사용자가 credentials.json 등은 배포 폴더에 직접 둠.
 
@@ -20,19 +69,7 @@ a = Analysis(
     pathex=[BASE],
     binaries=[],
     datas=datas,
-    hiddenimports=[
-        'customtkinter',
-        'PIL',
-        'PIL._tkinter_finder',
-        'pystray',
-        'pystray._win32',
-        'login',
-        'main_ui',
-        'blacklist_manager',
-        'gspread',
-        'google.auth',
-        'requests',
-    ],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

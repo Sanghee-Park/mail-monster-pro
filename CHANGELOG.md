@@ -1,5 +1,18 @@
 # MAIL MONSTER PRO 변경 이력
 
+## [v2.8.0] - 2026-09-17
+
+### 대한민국 영업일 09:00~18:00 자동발송
+- **발송 창**: KST 기준 월~금, 09:00 정각부터 18:00 직전까지. 주말·법정공휴일·대체공휴일·근로자의 날·임시공휴일(holidays 패키지 + `extra_holidays.json`) 제외.
+- **예약 대기**: 업무시간 외 시작 시 오류로 종료하지 않고 `scheduled_pause`로 저장. 다음 영업일 09:00에 자동 재개. 사용자 정지(`user_stopped`)는 자동 재개하지 않음.
+- **SQLite 영속 대기열**: `campaign_jobs` / `campaign_queue`를 기존 `sent_history.db`에 안전 추가. 수신자 스냅샷 사용, `recipients.json`에서 완료 건을 삭제하지 않음.
+- **PC 재부팅 복구**: 활성 작업이 있을 때만 `HKCU\...\Run`에 `--resume`으로 등록. 단일 인스턴스 mutex. 자동 로그인이 꺼져 있으면 안내 후 로그인 화면 유지. 데이터 경로는 cwd가 아니라 EXE/`__file__` 및 `%LOCALAPPDATA%\MAIL_MONSTER_PRO`.
+- **SMTP 비밀**: 캠페인 스냅샷에 비밀번호를 넣지 않음. 발송 시 `config.json`에서 조회. 자격증명·첨부 누락 시 `needs_attention`으로 중단.
+- **비정상 종료**: `sending` 항목은 `sent_log`의 Message-ID로 확인되면 `sent`, 아니면 `needs_review`(자동 재발송 없음). SMTP exactly-once는 불가능.
+- **확인 필요 UI**: `needs_review`는 항목별로 발송 완료 처리 / 다시 발송(중복 경고 후 해당 건만 pending) / 건너뛰기(사유) / 캠페인 취소. 첨부가 없으면 경로 표시 후 다시 지정하고, 파일이 있을 때만 재개.
+- **v2.7.3 데이터 승계**: 설치 폴더가 읽기 전용이면 `sent_history.db` 등 기존 파일을 `%LOCALAPPDATA%\MAIL_MONSTER_PRO`로 1회 복사(덮어쓰기·원본 삭제 없음). 포터블(쓰기 가능)은 실행 폴더를 그대로 사용.
+- **버전**: `login.py` / `main_ui.py` 폴백 / Inno `MyAppVersion` → `v2.8.0` / `2.8.0`. 원격 버전이 더 낮으면 업데이트 안내 없음.
+
 ## [v2.7.3] - 2026-06-16
 
 ### Phase 9 — Amazon SES 및 분리형 인증 방식 지원

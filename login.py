@@ -9,13 +9,24 @@ try:
 except ImportError:
     requests = None
 
-if getattr(sys, 'frozen', False):
-    BASE_DIR = os.path.dirname(sys.executable)
-else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+from app_paths import bundled_file, install_dir, writable_file
+from data_migrate import format_migration_user_message, last_migration_report, prepare_user_data
+from login_network import AUTOSTART_NET_DELAYS, is_auth_error, is_transient_network_error
+from version_compare import (
+    compare_versions,
+    evaluate_update_prompt,
+    normalize_version_for_compare,
+    should_prompt_update,
+    strip_invisible_chars,
+    version_numeric_tuple,
+    versions_effectively_equal,
+)
+
+BASE_DIR = install_dir()
+CREDENTIALS_FILE = bundled_file("credentials.json")
 
 # Phase 8 Task 8-x: 구글 시트 버전과 비교할 앱 현재 버전
-CURRENT_VERSION = "v2.7.3"
+CURRENT_VERSION = "v2.8.0"
 SPREADSHEET_KEY = "1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw"
 
 # GitHub 릴리스 연동: 시트 B1이 비어 있거나 "GITHUB"이면 최신 Release의 .exe URL 사용 (구글 드라이브 불필요)
@@ -24,57 +35,27 @@ SPREADSHEET_KEY = "1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw"
 GITHUB_RELEASE_REPO_DEFAULT = "Sanghee-Park/mail-monster-pro"
 
 
+class LoginUserError(Exception):
+    def __init__(self, title, message):
+        self.title = title
+        super().__init__(message)
+
+
 def _strip_invisible_chars(s):
-    """시트/복사 시 끼는 zero-width, BOM, NBSP 등 제거 (strip()만으로는 안 지워지는 경우 있음)."""
-    if s is None:
-        return ""
-    t = str(s)
-    for ch in ("\u200b", "\u200c", "\u200d", "\ufeff", "\u00a0", "\u200e", "\u200f", "\u2028", "\u2029"):
-        t = t.replace(ch, "")
-    try:
-        t = unicodedata.normalize("NFKC", t)
-    except Exception:
-        pass
-    return t.strip()
+    return strip_invisible_chars(s)
 
 
 def _normalize_version_for_compare(s):
-    """Task 1-1: 시트/앱 버전 문자열을 strip().lower() 적용 후 비교 (공백·대소문자 오류 방지)."""
-    if s is None:
-        return ""
-    t = _strip_invisible_chars(s).lower()
-    t = t.replace("\t", " ").replace("\r", "").replace("\n", " ")
-    t = t.strip()
-    if len(t) > 1 and t.startswith("v") and (t[1].isdigit() or t[1] == "."):
-        t = t[1:].lstrip()
-    return t.strip()
+    return normalize_version_for_compare(s)
 
 
 def _version_numeric_tuple(s):
-    """'2.5.2', 'v2.5.2', 시트 숫자 셀 등에서 숫자 세그먼트 튜플 추출 (예: (2, 5, 2))."""
-    t = _normalize_version_for_compare(s)
-    if not t:
-        return ()
-    t = t.replace(",", ".")
-    m = re.search(r"(\d+(?:\.\d+)*)", t)
-    if not m:
-        return ()
-    parts = [p for p in m.group(1).split(".") if p.isdigit()]
-    try:
-        return tuple(int(p) for p in parts)
-    except ValueError:
-        return ()
+    return version_numeric_tuple(s)
 
 
 def _versions_effectively_equal(sheet_version, app_version):
-    """시트 값과 앱 CURRENT_VERSION이 같은 버전이면 True (공백·유니코드·v 접두·숫자 형식 차이 허용)."""
-    ta = _version_numeric_tuple(sheet_version)
-    tb = _version_numeric_tuple(app_version)
-    if ta and tb and ta == tb:
-        return True
-    a = _normalize_version_for_compare(sheet_version)
-    b = _normalize_version_for_compare(app_version)
-    return bool(a) and bool(b) and a == b
+    """시트 값과 앱 CURRENT_VERSION이 같은 버전이면 True."""
+    return versions_effectively_equal(sheet_version, app_version)
 
 
 def _resolve_github_release_repo():
@@ -187,10 +168,16 @@ def _unblock_downloaded_file_win(path):
 
 
 class LoginApp(ctk.CTk):
-    def __init__(self, on_success):
+    def __init__(self, on_success, autostart_recovery=False):
         super().__init__()
         self.on_success = on_success
-        self.settings_file = os.path.join(BASE_DIR, "login_settings.json")
+        self.autostart_recovery = bool(autostart_recovery)
+        self._closing = False
+        self._login_cancel = False
+        self._autostart_login_running = False
+        self.update_check_notes = []
+        prepare_user_data()
+        self.settings_file = writable_file("login_settings.json")
         self.update_required = False
         self.update_url = ""
         self.latest_version = ""
@@ -205,7 +192,26 @@ class LoginApp(ctk.CTk):
         except: pass
         self.setup_login_ui()
         self.load_settings()
+        self._maybe_show_data_migration_notice()
         # 업데이트 체크는 앱 시작 시점이 아니라 "로그인 성공 직후"에 수행한다.
+
+    def _maybe_show_data_migration_notice(self):
+        report = last_migration_report()
+        msg = format_migration_user_message(report)
+        if not msg:
+            return
+        failed = bool(report and report.failed)
+        conflicts = bool(report and report.conflicts)
+        if self.autostart_recovery and not failed and not conflicts:
+            return
+        title = "데이터 복사 실패" if failed else ("데이터 위치 확인" if conflicts else "데이터 복사")
+        try:
+            if failed:
+                messagebox.showwarning(title, msg, parent=self)
+            else:
+                messagebox.showinfo(title, msg, parent=self)
+        except Exception:
+            pass
 
     def get_mac_address(self):
         return hex(uuid.getnode())
@@ -213,7 +219,7 @@ class LoginApp(ctk.CTk):
     def _check_update_from_sheet(self):
         """Phase 6 Task 6-1: 구글 시트 worksheet('설정') A1=최신 버전명, B1=exe 다운로드 링크를 읽어 업데이트 필요 여부 판별"""
         try:
-            cred_path = os.path.join(BASE_DIR, "credentials.json")
+            cred_path = CREDENTIALS_FILE
             if not os.path.exists(cred_path):
                 return
             client = gspread.service_account(filename=cred_path)
@@ -229,17 +235,19 @@ class LoginApp(ctk.CTk):
             # A1 비어 있으면 버전 비교 불가 → 업데이트 유도하지 않음 (로그인만)
             if not a1:
                 return
-            # 시트 버전과 앱 버전이 같으면 업데이트 없이 로그인 화면 유지
-            if _versions_effectively_equal(a1, CURRENT_VERSION):
+            prompt, reason = evaluate_update_prompt(a1, CURRENT_VERSION)
+            self.update_check_notes.append(reason)
+            if not prompt:
                 return
-            # 메인 스레드에서 한 번 더 검증 후 팝업 (시트·앱 문자열 차이 방지)
             self.after(0, lambda av=a1, url=b1: self._begin_update_if_needed(av, url))
         except Exception:
             pass
 
     def _begin_update_if_needed(self, latest_version, update_url):
-        """UI 스레드: 버전이 여전히 다를 때만 업데이트 진행. 같으면 창 숨김 없이 그대로 로그인 가능."""
-        if _versions_effectively_equal(latest_version, CURRENT_VERSION):
+        """UI 스레드: 원격 버전이 더 높을 때만 업데이트. 같거나 낮거나 잘못된 문자열은 무시."""
+        prompt, reason = evaluate_update_prompt(latest_version, CURRENT_VERSION)
+        self.update_check_notes.append(reason)
+        if not prompt:
             return
         if not (update_url or "").strip():
             return
@@ -440,7 +448,24 @@ Remove-Item -LiteralPath '{script_ps}' -Force
         self.auto_login_var = ctk.BooleanVar()
         ctk.CTkCheckBox(cb_f, text="자동 로그인", variable=self.auto_login_var).pack(side="left", padx=5)
 
-        ctk.CTkButton(wrap, text="로그인", height=45, command=self.check_login).pack(fill="x", pady=20)
+        self.autostart_notice = ctk.CTkLabel(
+            wrap,
+            text="",
+            font=("맑은 고딕", 11),
+            text_color="#f1c40f",
+            wraplength=340,
+            justify="left",
+        )
+        self.autostart_notice.pack(fill="x", pady=(0, 4))
+        self.cancel_autostart_btn = ctk.CTkButton(
+            wrap,
+            text="자동복구 로그인 취소",
+            height=36,
+            fg_color="#7f8c8d",
+            command=self.cancel_autostart_login,
+        )
+        self.login_btn = ctk.CTkButton(wrap, text="로그인", height=45, command=self.check_login)
+        self.login_btn.pack(fill="x", pady=20)
         ctk.CTkButton(
             wrap,
             text="회원가입 신청",
@@ -451,11 +476,20 @@ Remove-Item -LiteralPath '{script_ps}' -Force
         ).pack(fill="x")
 
     def load_settings(self):
+        d = {}
         if os.path.exists(self.settings_file):
             with open(self.settings_file, "r", encoding='utf-8') as f:
                 d = json.load(f)
                 if d.get("save_id"): self.id_ent.insert(0, d.get("id", "")); self.save_id_var.set(True)
                 if d.get("auto_login"): self.pw_ent.insert(0, d.get("pw", "")); self.auto_login_var.set(True); self.after(500, self.check_login)
+        if self.autostart_recovery and not d.get("auto_login"):
+            try:
+                self.autostart_notice.configure(
+                    text="Windows 시작 후 발송 작업을 이어가려면 자동 로그인이 필요합니다.\n"
+                    "비밀번호를 입력해 로그인해 주세요. 자동 로그인을 강제로 켜거나 비밀번호를 새로 저장하지는 않습니다."
+                )
+            except Exception:
+                pass
 
     def _fetch_update_info(self):
         """설정 시트 A1=최신 버전, B1=다운로드 URL.
@@ -465,7 +499,7 @@ Remove-Item -LiteralPath '{script_ps}' -Force
         latest, url = "", ""
         sha256_hex, release_page = None, ""
         try:
-            cred_path = os.path.join(BASE_DIR, "credentials.json")
+            cred_path = CREDENTIALS_FILE
             if os.path.exists(cred_path):
                 client = gspread.service_account(filename=cred_path)
                 spreadsheet = client.open_by_key(SPREADSHEET_KEY)
@@ -496,13 +530,11 @@ Remove-Item -LiteralPath '{script_ps}' -Force
         self.on_success(user_name, grade, rem, login_user_id)
 
     def _check_update_after_login(self, user_name, grade, rem, login_user_id=""):
-        """로그인 성공 직후 버전 확인: 같으면 실행, 다르면 권고 후 업데이트."""
+        """로그인 성공 직후: 원격 버전이 더 높을 때만 업데이트 안내."""
         latest_version, update_url, sha256_exp, release_page = self._fetch_update_info()
-        # A1에 버전이 있고 앱과 동일하면 B1(URL) 유무와 관계없이 즉시 실행 (같은 버전인데도 권고 팝업 방지)
-        if latest_version and _versions_effectively_equal(latest_version, CURRENT_VERSION):
-            self._launch_main_app(user_name, grade, rem, login_user_id)
-            return
-        if (not latest_version) or (not update_url):
+        prompt, reason = evaluate_update_prompt(latest_version, CURRENT_VERSION)
+        self.update_check_notes.append(reason)
+        if not prompt or not (update_url or "").strip():
             self._launch_main_app(user_name, grade, rem, login_user_id)
             return
 
@@ -518,30 +550,151 @@ Remove-Item -LiteralPath '{script_ps}' -Force
         else:
             self._launch_main_app(user_name, grade, rem, login_user_id)
 
-    def check_login(self):
+    def _set_autostart_notice(self, text):
+        try:
+            self.autostart_notice.configure(text=text or "")
+        except Exception:
+            pass
+
+    def cancel_autostart_login(self):
+        self._login_cancel = True
+        self._set_autostart_notice("자동복구 로그인을 취소합니다. 네트워크 대기가 끝나면 중단됩니다.")
+
+    def _persist_login_settings(self, uid, upw):
+        with open(self.settings_file, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "id": uid if self.save_id_var.get() else "",
+                    "pw": upw if self.auto_login_var.get() else "",
+                    "save_id": self.save_id_var.get(),
+                    "auto_login": self.auto_login_var.get(),
+                },
+                f,
+            )
+
+    def _authenticate_credentials(self):
         uid, upw = self.id_ent.get().strip(), self.pw_ent.get().strip()
         my_mac = self.get_mac_address()
+        client = gspread.service_account(filename=CREDENTIALS_FILE)
+        sheet = client.open_by_key("1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw").sheet1
+        all_data = sheet.get_all_values()
+        for i, row in enumerate(all_data[1:], start=2):
+            if row[0] == uid and row[1] == upw:
+                user_name, grade, raw_period = row[2], row[4], row[5]
+                while len(row) < 7:
+                    row.append("")
+                reg_mac = row[6]
+                if grade == "승인대기":
+                    raise LoginUserError("대기", "관리자 승인이 필요합니다.")
+                if reg_mac == "":
+                    sheet.update_cell(i, 7, my_mac)
+                elif reg_mac != my_mac and "관리자" not in grade:
+                    raise LoginUserError("차단", "다른 PC에서 사용 중인 계정입니다.")
+                rem = "PERMANENT" if raw_period == "영구" else str((datetime.strptime(raw_period, "%Y-%m-%d") - datetime.now()).days + 1)
+                return {"uid": uid, "upw": upw, "user_name": user_name, "grade": grade, "rem": rem}
+        raise LoginUserError("실패", "계정 정보가 틀립니다.")
+
+    def _apply_login_success(self, result):
+        self._persist_login_settings(result["uid"], result["upw"])
+        self._check_update_after_login(result["user_name"], result["grade"], result["rem"], result["uid"])
+
+    def _show_login_error(self, exc):
+        if isinstance(exc, LoginUserError):
+            if exc.title == "대기":
+                messagebox.showwarning("대기", str(exc))
+            else:
+                messagebox.showerror(exc.title, str(exc))
+            return
+        messagebox.showerror("오류", f"접속 실패: {exc}")
+
+    def _hide_cancel_autostart_btn(self):
         try:
-            client = gspread.service_account(filename=os.path.join(BASE_DIR, 'credentials.json'))
-            sheet = client.open_by_key("1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw").sheet1 #
-            all_data = sheet.get_all_values()
-            for i, row in enumerate(all_data[1:], start=2):
-                if row[0] == uid and row[1] == upw:
-                    user_name, grade, raw_period = row[2], row[4], row[5]
-                    while len(row) < 7: row.append("")
-                    reg_mac = row[6] # G열 기기값
-                    if grade == "승인대기": messagebox.showwarning("대기", "관리자 승인이 필요합니다."); return
-                    if reg_mac == "": sheet.update_cell(i, 7, my_mac)
-                    elif reg_mac != my_mac and "관리자" not in grade:
-                        messagebox.showerror("차단", "다른 PC에서 사용 중인 계정입니다."); return
-                    
-                    rem = "PERMANENT" if raw_period == "영구" else str((datetime.strptime(raw_period, '%Y-%m-%d') - datetime.now()).days + 1)
-                    with open(self.settings_file, "w", encoding='utf-8') as f:
-                        json.dump({"id": uid if self.save_id_var.get() else "", "pw": upw if self.auto_login_var.get() else "", "save_id": self.save_id_var.get(), "auto_login": self.auto_login_var.get()}, f)
-                    self._check_update_after_login(user_name, grade, rem, uid)
+            self.cancel_autostart_btn.pack_forget()
+        except Exception:
+            pass
+
+    def _autostart_login_worker(self):
+        last_err = None
+        delays = AUTOSTART_NET_DELAYS
+        try:
+            for attempt, delay in enumerate(delays):
+                if self._login_cancel or self._closing:
+                    self.after(0, lambda: self._set_autostart_notice("자동복구 로그인이 취소되었습니다."))
                     return
-            messagebox.showerror("실패", "계정 정보가 틀립니다.")
-        except Exception as e: messagebox.showerror("오류", f"접속 실패: {e}")
+                if delay:
+                    self.after(
+                        0,
+                        lambda d=delay, a=attempt, n=len(delays) - 1: self._set_autostart_notice(
+                            f"네트워크가 아직 준비되지 않았습니다. {d}초 후 재시도합니다. ({a}/{n})\n취소를 누르면 중단됩니다."
+                        ),
+                    )
+                    deadline = time.time() + delay
+                    while time.time() < deadline:
+                        if self._login_cancel or self._closing:
+                            self.after(0, lambda: self._set_autostart_notice("자동복구 로그인이 취소되었습니다."))
+                            return
+                        time.sleep(0.2)
+                try:
+                    result = self._authenticate_credentials()
+                    self.after(0, lambda r=result: self._apply_login_success(r))
+                    return
+                except LoginUserError as e:
+                    self.after(0, lambda err=e: (self._set_autostart_notice(str(err)), self._show_login_error(err)))
+                    return
+                except Exception as e:
+                    if is_auth_error(e):
+                        self.after(
+                            0,
+                            lambda err=e: (
+                                self._set_autostart_notice("인증 오류로 자동복구 로그인을 중단했습니다."),
+                                messagebox.showerror("오류", f"접속 실패: {err}"),
+                            ),
+                        )
+                        return
+                    if not is_transient_network_error(e):
+                        self.after(
+                            0,
+                            lambda err=e: (
+                                self._set_autostart_notice(f"자동복구 로그인 실패: {err}"),
+                                messagebox.showerror("오류", f"접속 실패: {err}"),
+                            ),
+                        )
+                        return
+                    last_err = e
+            self.after(
+                0,
+                lambda err=last_err: (
+                    self._set_autostart_notice(f"네트워크 준비 실패로 자동복구를 중단했습니다.\n{err}"),
+                    messagebox.showerror("오류", f"자동복구 로그인 실패(네트워크): {err}"),
+                ),
+            )
+        finally:
+            self._autostart_login_running = False
+            self.after(0, self._hide_cancel_autostart_btn)
+
+    def check_login(self):
+        if self.autostart_recovery and bool(self.auto_login_var.get()):
+            if self._autostart_login_running:
+                return
+            self._autostart_login_running = True
+            self._login_cancel = False
+            try:
+                self.cancel_autostart_btn.pack(fill="x", pady=(0, 8), before=self.login_btn)
+            except Exception:
+                try:
+                    self.cancel_autostart_btn.pack(fill="x", pady=(0, 8))
+                except Exception:
+                    pass
+            self._set_autostart_notice("Windows 시작 직후 네트워크를 확인하는 중입니다.")
+            threading.Thread(target=self._autostart_login_worker, daemon=True).start()
+            return
+        try:
+            result = self._authenticate_credentials()
+            self._apply_login_success(result)
+        except LoginUserError as e:
+            self._show_login_error(e)
+        except Exception as e:
+            messagebox.showerror("오류", f"접속 실패: {e}")
 
     def open_reg(self): # 회원가입 팝업 (생략 - 기존 로직과 동일)
         pop = ctk.CTkToplevel(self)
@@ -579,7 +732,7 @@ Remove-Item -LiteralPath '{script_ps}' -Force
             def worker():
                 try:
                     status_lbl.configure(text="신청 처리 중...")
-                    client = gspread.service_account(filename=os.path.join(BASE_DIR, 'credentials.json'))
+                    client = gspread.service_account(filename=CREDENTIALS_FILE)
                     sheet = client.open_by_key("1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw").sheet1
                     all_data = sheet.get_all_values()
 

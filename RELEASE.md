@@ -1,4 +1,4 @@
-# MAIL MONSTER PRO — 운영 배포 체크리스트 (v2.7.1 기준)
+# MAIL MONSTER PRO — 운영 배포 체크리스트 (v2.8.0 기준)
 
 ## 1. 버전 한 곳에서 맞추기
 
@@ -6,10 +6,10 @@
 
 | 위치 | 형식 예 |
 |------|---------|
-| `login.py` → `CURRENT_VERSION` | `v2.7.1` |
-| `installer/MAIL_MONSTER_PRO.iss` → `#define MyAppVersion` | `2.7.1` (v 없음) |
-| 구글 시트 `설정` **A1** | `v2.7.1` (사용자에게 보이는 최신 버전) |
-| Git 태그 | `v2.7.1` |
+| `login.py` → `CURRENT_VERSION` | `v2.8.0` |
+| `installer/MAIL_MONSTER_PRO.iss` → `#define MyAppVersion` | `2.8.0` (v 없음) |
+| 구글 시트 `설정` **A1** | `v2.8.0` (사용자에게 보이는 최신 버전) |
+| Git 태그 | `v2.8.0` |
 
 ## 2. 로컬 패키징 (Windows)
 
@@ -31,10 +31,10 @@
 
 ```bash
 git add -A
-git commit -m "release: v2.7.1"
-git tag v2.7.1
+git commit -m "release: v2.8.0"
+git tag v2.8.0
 git push origin main
-git push origin v2.7.1
+git push origin v2.8.0
 ```
 
 2. Actions **Build and Release** 가 `MAIL_MONSTER_PRO.exe` + `.sha256` 을 Release에 올립니다.
@@ -43,9 +43,9 @@ git push origin v2.7.1
 
 ### Release가 GitHub에 안 보일 때
 
-- **정상 지연**: 태그를 올린 직후 **Releases** 탭에는 아무 것도 없을 수 있습니다. 워크플로가 **PyInstaller**를 돌리는 동안(대략 **10~20분**)은 Release가 아직 **생성되지 않습니다**. 마지막 단계 **Upload release assets**가 성공해야 `v2.7.1` Release와 exe가 보입니다.
-- **태그만 먼저 확인**: 저장소 **Code → 태그**에 `v2.7.1`가 있으면 푸시는 된 것입니다. Release는 Actions 성공 후에 나타납니다.
-- **Actions 실패**: **Actions** → **Build and Release (Windows)** → 실패한 실행 → 로그에서 `PyInstaller` 또는 `Install dependencies` 오류 확인. 워크플로에 **Run workflow**가 있으면 동일 태그(예: `v2.7.1`)를 넣고 수동 재실행할 수 있습니다.
+- **정상 지연**: 태그를 올린 직후 **Releases** 탭에는 아무 것도 없을 수 있습니다. 워크플로가 **PyInstaller**를 돌리는 동안(대략 **10~20분**)은 Release가 아직 **생성되지 않습니다**. 마지막 단계 **Upload release assets**가 성공해야 `v2.8.0` Release와 exe가 보입니다.
+- **태그만 먼저 확인**: 저장소 **Code → 태그**에 `v2.8.0`가 있으면 푸시는 된 것입니다. Release는 Actions 성공 후에 나타납니다.
+- **Actions 실패**: **Actions** → **Build and Release (Windows)** → 실패한 실행 → 로그에서 `PyInstaller` 또는 `Install dependencies` 오류 확인. 워크플로에 **Run workflow**가 있으면 동일 태그(예: `v2.8.0`)를 넣고 수동 재실행할 수 있습니다.
 
 ## 4. 사용자에게 같이 줄 것
 
@@ -57,4 +57,8 @@ git push origin v2.7.1
 
 - [BUILD.md](BUILD.md) — 환경·빌드 상세  
 - [UPDATE_VIA_GITHUB.md](UPDATE_VIA_GITHUB.md) — GitHub 전용 업데이트  
-- [DEPLOY_GITHUB.md](DEPLOY_GITHUB.md) — Git 원격·푸시  
+- [DEPLOY_GITHUB.md](DEPLOY_GITHUB.md) — Git 원격·푸시
+
+## 6. 발송 의미론 (exactly-once 불가)
+
+SMTP 서버가 메일을 접수한 직후, 로컬 DB에 `sent`를 쓰기 전에 프로세스가 종료되면 결과를 단정할 수 없습니다. v2.8.0은 이 경우 **재발송하지 않고** 사용자 확인(`needs_review`)을 요청합니다. 자세한 내용은 [README.md](README.md)를 보세요.

@@ -14,6 +14,50 @@ from email.utils import formataddr
 from PIL import Image, ImageDraw
 import pystray
 
+from business_hours import (
+    POLICY_TEXT,
+    BusinessHours,
+    as_kst,
+    ensure_extra_holidays_file,
+)
+from campaign_store import (
+    DuplicateActiveCampaignError,
+    JOB_CANCELLED,
+    JOB_COMPLETED,
+    JOB_NEEDS_ATTENTION,
+    JOB_QUEUED,
+    JOB_RUNNING,
+    JOB_SCHEDULED_PAUSE,
+    JOB_USER_STOPPED,
+    RESUME_JOB_STATUSES,
+    CampaignStore,
+)
+from campaign_runtime import CampaignRunner
+from campaign_attachments import format_missing_files_reason, missing_attachment_paths
+from campaign_attention import (
+    ACTION_MARK_SENT,
+    ACTION_RESEND,
+    ACTION_SKIP,
+    RESEND_WARNING,
+    ReviewActionError,
+    cancel_campaign,
+    list_review_items,
+    maybe_release_attention,
+    replace_job_attachments,
+    resolve_review_item,
+)
+from autostart import is_autostart_enabled, sync_autostart
+from app_paths import (
+    bundled_file,
+    extra_holidays_example_path,
+    extra_holidays_user_path,
+    install_dir,
+    resolve_state_files,
+    writable_file,
+)
+from smtp_credentials import public_smtp_snapshot, resolve_smtp_for_send, snapshot_contains_secrets
+from ui_safe import schedule_on_ui
+
 # 블랙리스트 관리 모듈 (Task 5-1)
 try:
     from blacklist_manager import BlacklistManager
@@ -33,10 +77,10 @@ except ImportError:
 # 구글 시트 블랙리스트 동기화용 (Phase 5, login과 동일 스프레드시트)
 BLACKLIST_SHEET_KEY = "1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw"
 
-if getattr(sys, 'frozen', False):
-    BASE_DIR = os.path.dirname(sys.executable)
-else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BLACKLIST_SHEET_KEY = "1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw"
+
+BASE_DIR = install_dir()
+STATE_FILES = resolve_state_files()
 
 
 # Phase 4: 계정별 로그 박스 무한 누적 방지 (발송 로직과 무관)
@@ -167,25 +211,50 @@ def _parse_sender_profile_from_entry(entry):
     return d
 
 
+CAMPAIGN_STATUS_KO = {
+    JOB_QUEUED: "작업 등록 완료",
+    JOB_RUNNING: "발송 중",
+    JOB_SCHEDULED_PAUSE: "업무시간 외 자동 대기",
+    JOB_USER_STOPPED: "사용자 정지",
+    JOB_NEEDS_ATTENTION: "사용자 확인 필요",
+    JOB_COMPLETED: "전체 처리 완료",
+    JOB_CANCELLED: "작업 취소",
+}
+
+
 class ModernMailSender(ctk.CTk):
-    def __init__(self, user_name="사용자", grade="무료권", remaining="0", login_user_id=""):
+    def __init__(self, user_name="사용자", grade="무료권", remaining="0", login_user_id="", autostart_recovery=False):
         super().__init__()
         self.user_name, self.grade, self.remaining = user_name, grade, remaining
         self.login_user_id = (login_user_id or "").strip()
-        self.config_file = os.path.join(BASE_DIR, "config.json")
-        self.user_profiles_file = os.path.join(BASE_DIR, "user_profiles.json")
-        self.template_file = os.path.join(BASE_DIR, "templates.json")
-        self.recipients_file = os.path.join(BASE_DIR, "recipients.json")
-        self.db_path = os.path.join(BASE_DIR, "sent_history.db")
+        self.autostart_recovery = bool(autostart_recovery)
+        self._closing = False
+        self._start_in_flight = {}
+        self._engine_locks = {}
+        paths = resolve_state_files()
+        self.config_file = paths["config.json"]
+        self.user_profiles_file = paths["user_profiles.json"]
+        self.template_file = paths["templates.json"]
+        self.recipients_file = paths["recipients.json"]
+        self.db_path = paths["sent_history.db"]
         self.log_consoles, self.stop_flags, self.tree_views, self.progress_labels = {}, {}, {}, {}
+        self.campaign_ui, self.campaign_buttons, self.campaign_job_ids = {}, {}, {}
+        self.campaign_cancel_flags = {}
         self._smtp_account_entries = {}
         self.current_template_name = {}
+        extra_path = extra_holidays_user_path()
+        try:
+            ensure_extra_holidays_file(extra_path)
+        except Exception:
+            pass
+        self.business_hours = BusinessHours(extra_path=extra_path)
+        self.campaign_store = None
         self.icon_filename = "pro.ico"
         
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.7.3"
+            CURRENT_VERSION = "v2.8.0"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686")  # 기본 크기
         self.minsize(800, 520)  # 축소 시 레이아웃 붕괴·버튼 소실 방지
@@ -200,12 +269,15 @@ class ModernMailSender(ctk.CTk):
             self._atomic_write_json_path(self.user_profiles_file, {}, indent=2, ensure_ascii=False)
         if not os.path.exists(self.recipients_file):
             self._atomic_write_json_path(self.recipients_file, {}, indent=2, ensure_ascii=False)
+        self._recovery_started = False
         self._migrate_legacy_sender_profile_once()
         self.init_db()
+        self.campaign_store = CampaignStore(self.db_path)
         self.setup_ui()
         # Phase 3 Task 3-1: (옵션) 구글 시트 '발송내역' → 로컬 DB 동기화 — 기본은 끔(로컬 DB만)
         if self._sheet_sent_log_enabled():
             threading.Thread(target=self._run_startup_sent_log_sync, daemon=True).start()
+        self.after(400, self._recover_campaigns_if_any)
 
     def init_db(self):
         con = sqlite3.connect(self.db_path)
@@ -241,6 +313,9 @@ class ModernMailSender(ctk.CTk):
             cols = [c[1] for c in con.execute("PRAGMA table_info(sent_log)").fetchall()]
             if "content_hash" not in cols:
                 con.execute("ALTER TABLE sent_log ADD COLUMN content_hash TEXT")
+            cols = [c[1] for c in con.execute("PRAGMA table_info(sent_log)").fetchall()]
+            if "message_id" not in cols:
+                con.execute("ALTER TABLE sent_log ADD COLUMN message_id TEXT")
 
             con.execute("CREATE INDEX IF NOT EXISTS idx_sent_task_email ON sent_log(task_key, email)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_sent_email_template ON sent_log(email, template_name)")
@@ -331,7 +406,7 @@ class ModernMailSender(ctk.CTk):
             return t
         return ((subject or "").strip()[:500] or "(미지정)")
 
-    def record_success_to_db(self, task_key, provider, account_idx, comp, email, subject, template_name="", content_hash=None):
+    def record_success_to_db(self, task_key, provider, account_idx, comp, email, subject, template_name="", content_hash=None, message_id=None):
         # 수신처 불명확/실패/미전송은 저장하지 않음: 성공했을 때만 호출
         if not comp:
             return
@@ -342,10 +417,11 @@ class ModernMailSender(ctk.CTk):
         sender = (self.user_name or "").strip()
         acc = (self.login_user_id or "").strip()
         ch = (content_hash or "").strip() or None
+        mid = (message_id or "").strip() or None
         con = sqlite3.connect(self.db_path)
         try:
             con.execute(
-                "INSERT INTO sent_log(task_key, provider, account_idx, comp, email, subject, template_name, sent_at, sender, account_id, content_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO sent_log(task_key, provider, account_idx, comp, email, subject, template_name, sent_at, sender, account_id, content_hash, message_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     task_key,
                     provider,
@@ -358,6 +434,7 @@ class ModernMailSender(ctk.CTk):
                     sender,
                     acc or None,
                     ch,
+                    mid,
                 ),
             )
             con.commit()
@@ -515,7 +592,7 @@ class ModernMailSender(ctk.CTk):
             return 0
         if gspread is None:
             return 0
-        cred_path = os.path.join(BASE_DIR, "credentials.json")
+        cred_path = bundled_file("credentials.json")
         if not os.path.exists(cred_path):
             return 0
         try:
@@ -582,7 +659,7 @@ class ModernMailSender(ctk.CTk):
             return
         if gspread is None:
             return
-        cred_path = os.path.join(BASE_DIR, "credentials.json")
+        cred_path = bundled_file("credentials.json")
         if not os.path.exists(cred_path):
             return
         try:
@@ -697,8 +774,13 @@ class ModernMailSender(ctk.CTk):
 
     def on_closing(self):
         res = messagebox.askyesnocancel("종료 확인", "프로그램을 트레이로 최소화할까요?")
-        if res is True: self.withdraw(); threading.Thread(target=self.run_tray, daemon=True).start()
-        elif res is False: self.destroy(); os._exit(0)
+        if res is True:
+            self.withdraw()
+            threading.Thread(target=self.run_tray, daemon=True).start()
+        elif res is False:
+            self._closing = True
+            self.destroy()
+            os._exit(0)
 
     def run_tray(self):
         try: img = Image.open(os.path.join(BASE_DIR, self.icon_filename))
@@ -801,7 +883,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.7.3"
+            _ver = "v2.8.0"
 
         title_lbl = ctk.CTkLabel(
             header,
@@ -1122,6 +1204,14 @@ class ModernMailSender(ctk.CTk):
         label = self._sidebar_label_text(task_key, self.task_key_to_index.get(task_key, 0) or 0)
         if not login_id:
             messagebox.showinfo("안내", "이 슬롯에는 저장된 SMTP 계정이 없습니다.", parent=self)
+            return
+        if self.campaign_store and self.campaign_store.has_active_job_for_user(self.login_user_id):
+            messagebox.showwarning(
+                "계정 삭제 불가",
+                "진행 중이거나 예약 대기 중인 자동발송 작업이 있어 계정을 삭제할 수 없습니다.\n"
+                "작업을 완료하거나 취소한 뒤 다시 시도해 주세요.",
+                parent=self,
+            )
             return
         if not messagebox.askyesno(
             "계정 삭제",
@@ -1911,8 +2001,86 @@ class ModernMailSender(ctk.CTk):
             text_color="#dfe6e9",
         ).pack(anchor="w", padx=12, pady=(0, 10))
 
+        hours_banner = ctk.CTkFrame(send_f, fg_color="#14332a", corner_radius=8)
+        hours_banner.pack(fill="x", pady=(4, 6))
+        ctk.CTkLabel(
+            hours_banner,
+            text=POLICY_TEXT,
+            font=("맑은 고딕", 12, "bold"),
+            text_color="#b8f5d1",
+        ).pack(anchor="w", padx=12, pady=(8, 2))
+        camp_status = ctk.CTkLabel(
+            hours_banner,
+            text="현재 작업 상태: 대기",
+            font=self._font_small,
+            text_color="#ecf0f1",
+            anchor="w",
+            justify="left",
+        )
+        camp_status.pack(fill="x", padx=12, pady=(0, 2))
+        camp_resume = ctk.CTkLabel(
+            hours_banner,
+            text="다음 자동 재개 예정: -",
+            font=self._font_small,
+            text_color="#dfe6e9",
+            anchor="w",
+            justify="left",
+        )
+        camp_resume.pack(fill="x", padx=12, pady=(0, 2))
+        camp_counts = ctk.CTkLabel(
+            hours_banner,
+            text="전체 0 · 성공 0 · 건너뜀 0 · 실패 0 · 남은 0",
+            font=self._font_small,
+            text_color="#dfe6e9",
+            anchor="w",
+            justify="left",
+        )
+        camp_counts.pack(fill="x", padx=12, pady=(0, 2))
+        camp_autostart = ctk.CTkLabel(
+            hours_banner,
+            text="PC 재부팅 후 자동복구: 비활성",
+            font=self._font_small,
+            text_color="#95a5a6",
+            anchor="w",
+            justify="left",
+        )
+        camp_autostart.pack(fill="x", padx=12, pady=(0, 4))
+        camp_fix = ctk.CTkButton(
+            hours_banner,
+            text="확인 필요 해결",
+            width=160,
+            command=lambda k=task_key: self._open_attention_for_key(k),
+        )
+        camp_fix.pack(anchor="w", padx=12, pady=(0, 8))
+        self.campaign_ui[task_key] = {
+            "status": camp_status,
+            "resume": camp_resume,
+            "counts": camp_counts,
+            "autostart": camp_autostart,
+            "fix": camp_fix,
+        }
+
         def start():
-            self.stop_flags[task_key] = False
+            if self._start_in_flight.get(task_key) or self._engine_locks.get(task_key) and self._engine_locks[task_key].locked():
+                return
+            if self.campaign_store:
+                blocking = self.campaign_store.find_blocking_job(self.login_user_id)
+                if blocking:
+                    bkey = blocking.get("task_key") or ""
+                    if blocking.get("status") == JOB_NEEDS_ATTENTION:
+                        self._prompt_needs_attention(blocking)
+                        return
+                    if bkey == task_key and blocking.get("status") in RESUME_JOB_STATUSES:
+                        if self._engine_locks.get(task_key) and self._engine_locks[task_key].locked():
+                            return
+                    if bkey and bkey != task_key:
+                        messagebox.showwarning(
+                            "캠페인 중복",
+                            "이미 진행 중이거나 예약 대기 중인 자동발송이 있습니다.\n"
+                            "한 사용자당 활성 캠페인은 하나만 실행됩니다.",
+                            parent=t3,
+                        )
+                        return
             interval = interval_cb.get()
             prevent_dup = prevent_dup_var.get()
             apply_public_filter = public_filter_var.get()
@@ -1946,6 +2114,9 @@ class ModernMailSender(ctk.CTk):
             template_name = _dedup_template_key(self.current_template_name.get(task_key), title_e.get())
             self.current_template_name[task_key] = template_name
 
+            self._start_in_flight[task_key] = True
+            self.stop_flags[task_key] = False
+            self._set_send_buttons(task_key, "running")
             threading.Thread(
                 target=self.real_engine,
                 args=(
@@ -1975,6 +2146,18 @@ class ModernMailSender(ctk.CTk):
         test_b.pack(side="left", fill="x", expand=True, padx=4)
         stop_b = ctk.CTkButton(btn_f, text="🛑 중지", height=42, state="disabled", font=self._font_small, command=lambda: self.set_stop(task_key))
         stop_b.pack(side="right", fill="x", expand=True, padx=4)
+        cancel_b = ctk.CTkButton(
+            btn_f,
+            text="작업 취소",
+            height=42,
+            width=90,
+            state="disabled",
+            fg_color="#7f8c8d",
+            font=self._font_small,
+            command=lambda: self.set_cancel(task_key),
+        )
+        cancel_b.pack(side="right", padx=4)
+        self.campaign_buttons[task_key] = {"start": send_b, "stop": stop_b, "cancel": cancel_b, "test": test_b}
 
         log_t = ctk.CTkTextbox(send_f, height=72, font=("Consolas", 11), fg_color="#1e1e1e", text_color="#00ff00")
         log_t.pack(fill="x", pady=4)
@@ -2134,6 +2317,685 @@ class ModernMailSender(ctk.CTk):
             return f"{s} → {' | '.join(hints)}"
         return s
 
+    def _split_task_key(self, key):
+        s = str(key or "")
+        if "_" not in s:
+            return s, 1
+        p, i = s.rsplit("_", 1)
+        try:
+            return p, int(i)
+        except ValueError:
+            return s, 1
+
+    def _set_send_buttons(self, key, mode):
+        btns = self.campaign_buttons.get(key) or {}
+        start_b, stop_b, cancel_b = btns.get("start"), btns.get("stop"), btns.get("cancel")
+
+        def apply():
+            try:
+                if mode in ("running", "paused"):
+                    if start_b:
+                        start_b.configure(state="disabled")
+                    if stop_b:
+                        stop_b.configure(state="normal", fg_color="#dc3545")
+                    if cancel_b:
+                        cancel_b.configure(state="normal")
+                else:
+                    if start_b:
+                        start_b.configure(state="normal")
+                    if stop_b:
+                        stop_b.configure(state="disabled", fg_color="#555")
+                    if cancel_b:
+                        cancel_b.configure(state="disabled")
+            except Exception:
+                pass
+
+        schedule_on_ui(self, apply)
+
+    def _refresh_campaign_ui(self, key):
+        ui = self.campaign_ui.get(key)
+        if not ui or not self.campaign_store:
+            return
+        job_id = self.campaign_job_ids.get(key)
+        stats = self.campaign_store.stats_dict(job_id) if job_id else {}
+        status = stats.get("status") or ""
+        ko = CAMPAIGN_STATUS_KO.get(status, status or "대기")
+        nxt = stats.get("next_resume_at") or ""
+
+        def apply():
+            try:
+                ui["status"].configure(text=f"현재 작업 상태: {ko}")
+                if status == JOB_SCHEDULED_PAUSE:
+                    try:
+                        dt = datetime.fromisoformat(nxt) if nxt else self.business_hours.next_send_window_start()
+                        ui["resume"].configure(text=self.business_hours.format_resume_text(dt))
+                    except Exception:
+                        ui["resume"].configure(text=f"다음 자동 재개 예정: {nxt or '-'}")
+                elif status == JOB_RUNNING:
+                    ui["resume"].configure(text="다음 자동 재개 예정: 현재 발송 가능 시간")
+                else:
+                    ui["resume"].configure(text="다음 자동 재개 예정: -")
+                ui["counts"].configure(
+                    text=(
+                        f"전체 {int(stats.get('total') or 0)} · 성공 {int(stats.get('success') or 0)} · "
+                        f"건너뜀 {int(stats.get('skipped') or 0)} · 실패 {int(stats.get('failed') or 0)} · "
+                        f"남은 {int(stats.get('remaining') or 0)}"
+                    )
+                )
+                auto = "활성" if is_autostart_enabled() else "비활성"
+                ui["autostart"].configure(text=f"PC 재부팅 후 자동복구: {auto}")
+            except Exception:
+                pass
+
+        schedule_on_ui(self, apply)
+
+    def _sync_autostart_registry(self):
+        try:
+            active = bool(self.campaign_store and self.campaign_store.any_active_on_pc())
+            sync_autostart(active, base_dir=BASE_DIR)
+        except Exception:
+            pass
+        for k in list(self.campaign_ui.keys()):
+            self._refresh_campaign_ui(k)
+
+    def _lookup_sent_for_campaign_item(self, item, job=None):
+        mid = str((item or {}).get("message_id") or "").strip()
+        if not mid:
+            return False
+        con = sqlite3.connect(self.db_path)
+        try:
+            row = con.execute("SELECT 1 FROM sent_log WHERE message_id=? LIMIT 1", (mid,)).fetchone()
+            return row is not None
+        except Exception:
+            return False
+        finally:
+            con.close()
+
+    def _open_attention_for_key(self, key):
+        if not self.campaign_store:
+            return
+        job = None
+        jid = self.campaign_job_ids.get(key)
+        if jid:
+            job = self.campaign_store.get_job(jid)
+        if not job or job.get("status") != JOB_NEEDS_ATTENTION:
+            blocking = self.campaign_store.find_blocking_job(self.login_user_id)
+            if blocking and blocking.get("status") == JOB_NEEDS_ATTENTION:
+                job = blocking
+        if not job or job.get("status") != JOB_NEEDS_ATTENTION:
+            messagebox.showinfo("안내", "확인할 작업이 없습니다.", parent=self)
+            return
+        self._prompt_needs_attention(job)
+
+    def _attention_next_resume_iso(self) -> str:
+        return self.business_hours.next_send_window_start().isoformat(timespec="seconds")
+
+    def _release_attention_if_ready(self, job) -> str:
+        if not job:
+            return JOB_NEEDS_ATTENTION
+        job_id = job["job_id"]
+        key = job.get("task_key") or ""
+        live = resolve_smtp_for_send(self.config_file, key, self.campaign_store.job_smtp_config(job))
+        if not live:
+            self.campaign_store.set_needs_attention(
+                job_id, "SMTP 계정 자격증명을 찾을 수 없습니다. 계정 설정에서 비밀번호를 확인하세요."
+            )
+            return JOB_NEEDS_ATTENTION
+        return maybe_release_attention(
+            self.campaign_store,
+            job_id,
+            send_allowed=self.business_hours.is_send_allowed(),
+            next_resume_at=self._attention_next_resume_iso(),
+            now=self.business_hours.now(),
+        )
+
+    def _try_resume_after_attention(self, job) -> bool:
+        st = self._release_attention_if_ready(job)
+        return st in (JOB_RUNNING, JOB_SCHEDULED_PAUSE, JOB_COMPLETED)
+
+    def _start_after_attention_release(self, job_id, key, status):
+        self._sync_autostart_registry()
+        self._refresh_campaign_ui(key)
+        if status in (JOB_RUNNING, JOB_SCHEDULED_PAUSE):
+            self._set_send_buttons(key, "running" if status == JOB_RUNNING else "paused")
+            btns = self.campaign_buttons.get(key) or {}
+            threading.Thread(
+                target=self._start_campaign_runner,
+                args=(job_id, key, btns.get("start"), btns.get("stop")),
+                daemon=True,
+            ).start()
+        elif status == JOB_NEEDS_ATTENTION:
+            self._set_send_buttons(key, "paused")
+        else:
+            self._set_send_buttons(key, "idle")
+
+    def _prompt_needs_attention(self, job):
+        if not job:
+            return
+        job_id = job["job_id"]
+        key = job.get("task_key") or ""
+        win = ctk.CTkToplevel(self)
+        win.title("발송 확인 필요")
+        win.geometry("760x620")
+        win.transient(self)
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+
+        reason_lbl = ctk.CTkLabel(win, text="", font=self._font_small, justify="left", anchor="w", wraplength=720)
+        reason_lbl.pack(fill="x", padx=12, pady=(12, 4))
+        missing_box = ctk.CTkTextbox(win, height=90, font=self._font_small)
+        missing_box.pack(fill="x", padx=12, pady=(0, 6))
+        list_host = ctk.CTkScrollableFrame(win, height=260)
+        list_host.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        hint = ctk.CTkLabel(
+            win,
+            text="needs_review 항목은 자동으로 다시 보내지 않습니다. 항목마다 처리하세요.",
+            font=self._font_small,
+            text_color="#f8c471",
+            anchor="w",
+            justify="left",
+        )
+        hint.pack(fill="x", padx=12, pady=(0, 6))
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(fill="x", padx=12, pady=(0, 12))
+
+        def current_job():
+            return self.campaign_store.get_job(job_id) or {}
+
+        def refresh():
+            live = current_job()
+            reason = live.get("attention_reason") or "사용자 확인이 필요합니다."
+            attach = self.campaign_store.job_snapshot_attachments(live)
+            missing = missing_attachment_paths(attach)
+            reason_lbl.configure(text=reason)
+            missing_box.configure(state="normal")
+            missing_box.delete("1.0", "end")
+            if missing:
+                missing_box.insert("1.0", "누락된 파일 경로:\n" + "\n".join(missing))
+            else:
+                files = list((attach.get("files") or []))
+                imgs = dict((attach.get("imgs") or {}))
+                lines = ["첨부 파일은 모두 존재합니다."]
+                if files:
+                    lines.append("첨부: " + ", ".join(str(p) for p in files[:8]))
+                if imgs:
+                    lines.append("CID: " + ", ".join(f"{k}={v}" for k, v in list(imgs.items())[:8]))
+                missing_box.insert("1.0", "\n".join(lines))
+            missing_box.configure(state="disabled")
+            for child in list_host.winfo_children():
+                child.destroy()
+            items = list_review_items(self.campaign_store, job_id)
+            if not items:
+                ctk.CTkLabel(list_host, text="확인할 수신자가 없습니다.", anchor="w").pack(fill="x", pady=4)
+            for it in items:
+                row = ctk.CTkFrame(list_host, fg_color="#1b2631")
+                row.pack(fill="x", pady=3)
+                email = it.get("email") or ""
+                company = it.get("company") or ""
+                err = it.get("error_message") or ""
+                ctk.CTkLabel(
+                    row,
+                    text=f"{company} <{email}>\n{err}",
+                    anchor="w",
+                    justify="left",
+                    wraplength=420,
+                ).pack(side="left", padx=8, pady=6, fill="x", expand=True)
+                iid = int(it["id"])
+                ctk.CTkButton(
+                    row,
+                    text="발송 완료로 처리",
+                    width=130,
+                    command=lambda n=iid: on_item(n, ACTION_MARK_SENT),
+                ).pack(side="right", padx=4, pady=6)
+                ctk.CTkButton(
+                    row,
+                    text="다시 발송",
+                    width=90,
+                    fg_color="#b9770e",
+                    command=lambda n=iid: on_item(n, ACTION_RESEND),
+                ).pack(side="right", padx=4, pady=6)
+                ctk.CTkButton(
+                    row,
+                    text="건너뛰기",
+                    width=80,
+                    fg_color="#7f8c8d",
+                    command=lambda n=iid: on_item(n, ACTION_SKIP),
+                ).pack(side="right", padx=4, pady=6)
+
+        def finish_if_released():
+            live = current_job()
+            st = self._release_attention_if_ready(live)
+            if st == JOB_NEEDS_ATTENTION:
+                refresh()
+                return False
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._start_after_attention_release(job_id, key, st)
+            return True
+
+        def on_item(item_id, action):
+            note = ""
+            confirmed = False
+            if action == ACTION_RESEND:
+                if not messagebox.askyesno("중복 발송 경고", RESEND_WARNING + "\n\n이 수신자만 다시 대기열에 넣습니다.", parent=win):
+                    return
+                confirmed = True
+            elif action == ACTION_SKIP:
+                note = simpledialog.askstring("건너뛰기", "사유를 입력하세요.", parent=win) or ""
+                if not note.strip():
+                    messagebox.showwarning("사유 필요", "건너뛰기에는 사유가 필요합니다.", parent=win)
+                    return
+            elif action == ACTION_MARK_SENT:
+                if not messagebox.askyesno("발송 완료로 처리", "이미 발송된 것으로 기록합니다. 메일을 다시 보내지 않습니다.", parent=win):
+                    return
+            try:
+                resolve_review_item(
+                    self.campaign_store,
+                    item_id,
+                    action,
+                    note=note,
+                    now=self.business_hours.now(),
+                    resend_confirmed=confirmed,
+                )
+            except ReviewActionError as e:
+                messagebox.showwarning("처리 실패", str(e), parent=win)
+                return
+            finish_if_released()
+
+        def on_rebind_files():
+            files = filedialog.askopenfilenames(title="첨부파일 다시 지정", parent=win)
+            if not files:
+                return
+            _, missing = replace_job_attachments(self.campaign_store, job_id, files=list(files))
+            if missing:
+                messagebox.showwarning("파일 확인", "지정한 파일이 없거나 다른 첨부/CID가 아직 없습니다.\n" + "\n".join(missing[:12]), parent=win)
+            finish_if_released()
+
+        def on_rebind_cids():
+            live = current_job()
+            attach = self.campaign_store.job_snapshot_attachments(live)
+            keys = list((attach.get("imgs") or {}).keys())
+            files = filedialog.askopenfilenames(title="CID 이미지 다시 지정", parent=win)
+            if not files:
+                return
+            if keys:
+                imgs = {keys[i]: files[i] for i in range(min(len(keys), len(files)))}
+                if len(files) > len(keys):
+                    for extra in files[len(keys):]:
+                        imgs[os.path.basename(extra)] = extra
+            else:
+                imgs = {os.path.basename(p): p for p in files}
+            _, missing = replace_job_attachments(self.campaign_store, job_id, imgs=imgs)
+            if missing:
+                messagebox.showwarning("파일 확인", "아직 없는 파일이 있습니다.\n" + "\n".join(missing[:12]), parent=win)
+            finish_if_released()
+
+        def on_cancel_job():
+            if not messagebox.askyesno("캠페인 취소", "이 발송 작업을 취소합니다. 남은 수신자는 보내지 않습니다.", parent=win):
+                return
+            cancel_campaign(self.campaign_store, job_id, now=self.business_hours.now())
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._start_after_attention_release(job_id, key, JOB_CANCELLED)
+
+        ctk.CTkButton(btn_row, text="첨부파일 다시 지정", command=on_rebind_files).pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="CID 이미지 다시 지정", command=on_rebind_cids).pack(side="left", padx=4)
+        ctk.CTkButton(
+            btn_row,
+            text="캠페인 취소",
+            fg_color="#922b21",
+            command=on_cancel_job,
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="닫기", fg_color="#566573", command=win.destroy).pack(side="right", padx=4)
+        refresh()
+
+    def _ensure_campaign_job(self, p, i, title, body, s_name, data, interval, prevent_dup, apply_public_filter, template_name):
+        key = f"{p}_{i}"
+        blocking = self.campaign_store.find_blocking_job(self.login_user_id)
+        if blocking:
+            if blocking.get("status") == JOB_NEEDS_ATTENTION:
+                if self._try_resume_after_attention(blocking):
+                    return self.campaign_store.get_job(blocking["job_id"])
+                return blocking
+            if blocking.get("task_key") == key and blocking.get("status") in RESUME_JOB_STATUSES:
+                return blocking
+            if blocking.get("task_key") != key:
+                raise DuplicateActiveCampaignError(blocking)
+        existing = self.campaign_store.find_resumable_job(self.login_user_id, key)
+        if existing:
+            return existing
+        try:
+            with open(self.config_file, "r", encoding="utf-8") as f:
+                config = json.load(f).get(key)
+        except Exception:
+            config = None
+        state = self.load_recipients_state(key)
+        all_rows = state.get("rows", [])
+        if not config or not all_rows:
+            return None
+        live = resolve_smtp_for_send(self.config_file, key, config)
+        if not live:
+            raise RuntimeError("SMTP 계정 자격증명을 찾을 수 없습니다. 계정 설정에서 비밀번호를 확인하세요.")
+        attach = {
+            "files": list((data or {}).get("files") or []),
+            "imgs": dict((data or {}).get("imgs") or {}),
+        }
+        missing = missing_attachment_paths(attach)
+        if missing:
+            job = self.campaign_store.create_job(
+                login_user_id=self.login_user_id,
+                task_key=key,
+                provider=p,
+                account_idx=i,
+                subject=title,
+                body=body,
+                sender_name=s_name,
+                smtp_config=public_smtp_snapshot(config, key),
+                interval_label=interval,
+                prevent_dup=bool(prevent_dup),
+                apply_public_filter=bool(apply_public_filter),
+                template_name=_dedup_template_key(template_name, title),
+                attachments=attach,
+                recipients=all_rows,
+                status=JOB_NEEDS_ATTENTION,
+                now=self.business_hours.now(),
+            )
+            self.campaign_store.set_needs_attention(job["job_id"], format_missing_files_reason(missing))
+            return self.campaign_store.get_job(job["job_id"])
+        job = self.campaign_store.create_job(
+            login_user_id=self.login_user_id,
+            task_key=key,
+            provider=p,
+            account_idx=i,
+            subject=title,
+            body=body,
+            sender_name=s_name,
+            smtp_config=public_smtp_snapshot(config, key),
+            interval_label=interval,
+            prevent_dup=bool(prevent_dup),
+            apply_public_filter=bool(apply_public_filter),
+            template_name=_dedup_template_key(template_name, title),
+            attachments=attach,
+            recipients=all_rows,
+            status=JOB_QUEUED,
+            now=self.business_hours.now(),
+        )
+        if snapshot_contains_secrets(job.get("smtp_config_json")):
+            self.campaign_store.scrub_stored_smtp_secrets()
+            job = self.campaign_store.get_job(job["job_id"])
+        if self.business_hours.is_send_allowed():
+            self.campaign_store.set_status(job["job_id"], JOB_RUNNING, now=self.business_hours.now())
+        else:
+            nxt = self.business_hours.next_send_window_start()
+            self.campaign_store.set_status(
+                job["job_id"],
+                JOB_SCHEDULED_PAUSE,
+                next_resume_at=nxt.isoformat(timespec="seconds"),
+                now=self.business_hours.now(),
+            )
+        return self.campaign_store.get_job(job["job_id"])
+
+    def _start_campaign_runner(self, job_id, key, s_b=None, st_b=None):
+        lock = self._engine_locks.setdefault(key, threading.Lock())
+        if not lock.acquire(blocking=False):
+            p, i = self._split_task_key(key)
+            self.write_log(p, i, "이미 같은 작업의 발송 루프가 실행 중입니다.")
+            return "locked"
+        try:
+            return self._run_campaign_runner_locked(job_id, key, s_b, st_b)
+        finally:
+            try:
+                lock.release()
+            except RuntimeError:
+                pass
+
+    def _run_campaign_runner_locked(self, job_id, key, s_b=None, st_b=None):
+        job0 = self.campaign_store.get_job(job_id) or {}
+        p = job0.get("provider") or self._split_task_key(key)[0]
+        try:
+            i = int(job0.get("account_idx") or self._split_task_key(key)[1])
+        except Exception:
+            i = self._split_task_key(key)[1]
+        self.campaign_job_ids[key] = job_id
+        self._sync_autostart_registry()
+        self._refresh_campaign_ui(key)
+        interval_label = job0.get("interval_label") or "5분"
+
+        def prepare(job, item):
+            row_data = item.get("recipient") or {}
+            if not isinstance(row_data, dict):
+                row_data = {}
+            title = job.get("subject") or ""
+            body = job.get("body") or ""
+            s_name = job.get("sender_name") or ""
+            actual_template = _dedup_template_key(job.get("template_name"), title)
+            prevent_dup = bool(job.get("prevent_dup"))
+            apply_public_filter = bool(job.get("apply_public_filter"))
+            data = self.campaign_store.job_snapshot_attachments(job)
+            snapshot = self.campaign_store.job_smtp_config(job)
+            config = resolve_smtp_for_send(self.config_file, job.get("task_key") or key, snapshot)
+            if not config:
+                return "halt", "SMTP 계정 자격증명을 찾을 수 없습니다. 계정 설정에서 비밀번호를 확인한 뒤 다시 시작하세요."
+            if snapshot_contains_secrets(snapshot):
+                self.campaign_store.scrub_stored_smtp_secrets()
+            email = (item.get("email") or row_data.get("이메일") or row_data.get("email") or "").strip()
+            comp = item.get("company") or row_data.get("업체명") or row_data.get("comp") or ""
+            idx = item.get("seq") or 0
+            total = job.get("total_count") or 0
+            try:
+                if apply_public_filter and check_smart_filter(email, comp):
+                    self.write_log(
+                        p, i, f"🚫 [{idx}/{total}] 필터링: {comp} <{email}> (공공/단체 규칙 일치로 스킵됨)"
+                    )
+                    return "skipped", "public_filter"
+                bl, bl_email, bl_reason = self._is_blacklisted_detail(email)
+                if bl:
+                    reason_txt = f" / 사유: {bl_reason}" if bl_reason else ""
+                    self.write_log(
+                        p,
+                        i,
+                        f"🚫 [{idx}/{total}] 스킵: {comp} (블랙리스트 차단) <{email}> [매칭: {bl_email}{reason_txt}]",
+                    )
+                    return "skipped", "blacklist"
+                final_title, final_body = self._render_message_with_variables(key, title, body, row_data)
+                body_html, _embedded = self._process_body_html(final_body, comp)
+                body_hash = _hash_body_html_sha256(body_html)
+                if prevent_dup:
+                    dup, dup_reason, _ = self.check_duplicate_send_status(email, body_hash, actual_template)
+                    if dup and dup_reason in ("same_body_same_sender", "same_template_same_sender"):
+                        self.write_log(
+                            p,
+                            i,
+                            f"🚫 [{idx}/{total}] 스킵: {comp} (동일 계정·동일 본문 재발송) <{email}> 「{actual_template}」",
+                        )
+                        return "skipped", "duplicate"
+                msg = self._build_single_mime(config, s_name, email, final_title, final_body, data, comp, message_id=item.get("message_id"))
+                return "ready", {
+                    "msg": msg,
+                    "email": email,
+                    "comp": comp,
+                    "body_hash": body_hash,
+                    "final_title": final_title,
+                    "no": idx,
+                    "actual_template": actual_template,
+                    "message_id": item.get("message_id"),
+                    "config": config,
+                }
+            except Exception as e:
+                self.write_log(p, i, f"❌ [{idx}/{total}] {comp} <{email}> MIME 조립 오류: {e}")
+                return "error", str(e)
+
+        def send_once(payload, job, item):
+            config = payload.get("config") or resolve_smtp_for_send(
+                self.config_file, job.get("task_key") or key, self.campaign_store.job_smtp_config(job)
+            )
+            if not config:
+                return False, "자격증명 없음"
+            ok, err = self._send_once(config, payload["msg"])
+            idx = payload.get("no")
+            total = job.get("total_count") or 0
+            email, comp = payload.get("email"), payload.get("comp")
+            if ok:
+                self.write_log(p, i, f"✅ [{idx}/{total}] {comp} <{email}> 성공")
+                self.update_last_sent_state(key, idx, comp, email)
+                actual_template = payload.get("actual_template") or ""
+                final_title = payload.get("final_title") or ""
+                body_hash = payload.get("body_hash")
+                eff_tpl = self._effective_template_for_log(actual_template, final_title)
+                self.record_success_to_db(
+                    key, p, i, comp, email, final_title, actual_template, content_hash=body_hash, message_id=payload.get("message_id")
+                )
+                self.after(0, lambda c=comp, em=email, t=eff_tpl: self._append_cloud_sent_row(c, em, t))
+                self._update_stats_label()
+                lbl = self.progress_labels.get(key)
+                if lbl:
+                    at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self.after(
+                        0,
+                        lambda n=idx, c=comp, e=email, a=at: lbl.configure(
+                            text=f"마지막 성공 전송: {n}행  {c} <{e}>  ({a})"
+                        ),
+                    )
+            else:
+                self.write_log(
+                    p, i, f"❌ [{idx}/{total}] {comp} <{email}> 시도 실패: {self._translate_smtp_error(err)}"
+                )
+            return ok, err
+
+        def on_progress(stats):
+            self._refresh_campaign_ui(key)
+            st = (stats or {}).get("status")
+            if st == JOB_SCHEDULED_PAUSE:
+                self._set_send_buttons(key, "paused")
+            elif st == JOB_RUNNING:
+                self._set_send_buttons(key, "running")
+            elif st == JOB_NEEDS_ATTENTION:
+                self._set_send_buttons(key, "paused")
+
+        runner = CampaignRunner(
+            self.campaign_store,
+            self.business_hours,
+            prepare_fn=prepare,
+            send_once_fn=send_once,
+            is_user_stopped=lambda: bool(self.stop_flags.get(key)),
+            is_cancelled=lambda: bool(self.campaign_cancel_flags.get(key)),
+            interval_seconds_fn=lambda: self.get_wait_seconds(interval_label),
+            on_log=lambda m: self.write_log(p, i, m),
+            on_progress=on_progress,
+            max_retries=3,
+            wait_poll_seconds=1,
+            owner=f"{self.login_user_id}:{key}:{os.getpid()}",
+            sent_lookup_fn=lambda item, job=job0: self._lookup_sent_for_campaign_item(item, job),
+        )
+        result = runner.run(job_id, wait_off_hours=True)
+        self._refresh_campaign_ui(key)
+        self._sync_autostart_registry()
+        if result == JOB_SCHEDULED_PAUSE:
+            self._set_send_buttons(key, "paused")
+        elif result == JOB_NEEDS_ATTENTION:
+            self._set_send_buttons(key, "paused")
+            schedule_on_ui(self, lambda: self._prompt_needs_attention(self.campaign_store.get_job(job_id)))
+        else:
+            self._set_send_buttons(key, "idle")
+            if s_b is not None and st_b is not None:
+                self.reset_btns(s_b, st_b)
+        return result
+
+    def _recover_campaigns_if_any(self):
+        if not self.campaign_store or self._recovery_started:
+            return
+        self._recovery_started = True
+        uid = self.login_user_id or ""
+        try:
+            attention = self.campaign_store.list_needs_attention_jobs(uid)
+            jobs = self.campaign_store.list_resumable_jobs(uid)
+        except Exception:
+            return
+        for job in attention:
+            if (job.get("login_user_id") or "") != uid:
+                continue
+            key = job.get("task_key") or ""
+            p, i = self._split_task_key(key)
+            self.campaign_job_ids[key] = job["job_id"]
+            self.write_log(p, i, f"⚠ 사용자 확인이 필요합니다. {job.get('attention_reason') or ''}")
+            self._set_send_buttons(key, "paused")
+            self._refresh_campaign_ui(key)
+            schedule_on_ui(self, lambda j=job: self._prompt_needs_attention(j))
+        for job in jobs:
+            if (job.get("login_user_id") or "") != uid:
+                continue
+            key = job.get("task_key") or ""
+            if not key:
+                continue
+            if key in self._engine_locks and self._engine_locks[key].locked():
+                continue
+            self.stop_flags[key] = False
+            self.campaign_cancel_flags[key] = False
+            self.campaign_job_ids[key] = job["job_id"]
+            btns = self.campaign_buttons.get(key) or {}
+            p, i = self._split_task_key(key)
+            self.write_log(p, i, "🔁 저장된 발송 작업을 복구합니다.")
+            threading.Thread(
+                target=self._start_campaign_runner,
+                args=(job["job_id"], key, btns.get("start"), btns.get("stop")),
+                daemon=True,
+            ).start()
+        self._sync_autostart_registry()
+
+    def _send_once(self, config, msg):
+        """SMTP 1회 발송. 연결 끊김 시 즉시 1회 재접속은 같은 시도로 본다."""
+        def _connect_send_quit():
+            server = smtplib.SMTP_SSL(config["smtp"], int(config["port"]), timeout=20)
+            server.login(config["id"], config["pw"])
+            server.send_message(msg)
+            server.quit()
+            return True, "성공"
+
+        def _is_connection_error(e):
+            if e is None:
+                return False
+            err = str(e).strip()
+            if "Server not connected" in err or "Connection reset" in err:
+                return True
+            if isinstance(e, BrokenPipeError):
+                return True
+            if hasattr(smtplib, "SMTPServerDisconnected") and isinstance(e, smtplib.SMTPServerDisconnected):
+                return True
+            return False
+
+        server = None
+        try:
+            server = smtplib.SMTP_SSL(config["smtp"], int(config["port"]), timeout=20)
+            server.login(config["id"], config["pw"])
+            server.send_message(msg)
+            server.quit()
+            return True, "성공"
+        except (BrokenPipeError, OSError, smtplib.SMTPException) as e:
+            if server is not None:
+                try:
+                    server.close()
+                except Exception:
+                    pass
+            if _is_connection_error(e):
+                try:
+                    return _connect_send_quit()
+                except Exception as e2:
+                    return False, str(e2)
+            return False, str(e)
+        except Exception as e:
+            if server is not None:
+                try:
+                    server.close()
+                except Exception:
+                    pass
+            return False, str(e)
+
     def _send_with_retry(self, config, msg, max_retries=3):
         """최대 3회 재시도. Task 1-3: Server not connected / BrokenPipeError 시 연결 해제 후 1회 즉시 재접속 발송."""
         def _connect_send_quit():
@@ -2195,119 +3057,90 @@ class ModernMailSender(ctk.CTk):
         return False, "알 수 없는 오류"
 
     def real_engine(self, p, i, title, body, s_name, data, interval, prevent_dup, apply_public_filter, tree, s_b, st_b, template_name=""): #
-        key = f"{p}_{i}"; self.after(0, lambda: (s_b.configure(state="disabled"), st_b.configure(state="normal", fg_color="#dc3545")))
+        key = f"{p}_{i}"
+        self.stop_flags[key] = False
+        self.campaign_cancel_flags[key] = False
+        self._set_send_buttons(key, "running")
         try:
-            with open(self.config_file, 'r', encoding='utf-8') as f: config = json.load(f).get(key)
-            
-            # 트리뷰에서 표시 정보만 추출
-            tree_values = [tree.item(item)['values'] for item in tree.get_children()]
-            
-            # recipients.json에서 모든 데이터 로드 (동적 변수용)
-            state = self.load_recipients_state(key)
-            all_rows = state.get("rows", [])
-            
-            if not config or not all_rows: 
+            job = self._ensure_campaign_job(
+                p, i, title, body, s_name, data, interval, prevent_dup, apply_public_filter, template_name
+            )
+            if not job:
                 self.write_log(p, i, "❌ 계정/수신처 부족")
                 return
-
-            # v2.7.2: 같은 로그인 아이디+이메일+본문 HTML 해시로 스킵(로컬 DB). 템플릿명은 로그·시트용으로만 유지.
-            actual_template = _dedup_template_key(template_name, title)
-
-            # Phase 4: MIME 1건씩 조립→즉시 발송 (pre_composed 누적 제거). 스킵/간격은 기존과 동일.
-            need_wait_before_send = False
-            for idx, row_data in enumerate(all_rows, 1):
-                if self.stop_flags[key]:
-                    break
-                comp = row_data.get("업체명") or row_data.get("comp", "")
-                email = row_data.get("이메일") or row_data.get("email", "")
-                no = idx
+            if job.get("status") == JOB_NEEDS_ATTENTION:
+                self.write_log(p, i, job.get("attention_reason") or "사용자 확인이 필요합니다.")
+                self._set_send_buttons(key, "paused")
+                schedule_on_ui(self, lambda j=job: self._prompt_needs_attention(j))
+                return
+            if job.get("status") == JOB_SCHEDULED_PAUSE:
+                nxt = job.get("next_resume_at")
                 try:
-                    if apply_public_filter and check_smart_filter(email, comp):
-                        self.write_log(
-                            p,
-                            i,
-                            f"🚫 [{idx}/{len(all_rows)}] 필터링: {comp} <{email}> (공공/단체 규칙 일치로 스킵됨)",
-                        )
-                        continue
-                    # Phase 8: 블랙리스트 검사는 반드시 MIME 조립/발송 전 선행.
-                    bl, bl_email, bl_reason = self._is_blacklisted_detail(email)
-                    if bl:
-                        reason_txt = f" / 사유: {bl_reason}" if bl_reason else ""
-                        self.write_log(
-                            p,
-                            i,
-                            f"🚫 [{idx}/{len(all_rows)}] 스킵: {comp} (블랙리스트 차단) <{email}> [매칭: {bl_email}{reason_txt}]",
-                        )
-                        continue
-                    final_title, final_body = self._render_message_with_variables(key, title, body, row_data)
-                    body_html, _embedded_for_hash = self._process_body_html(final_body, comp)
-                    body_hash = _hash_body_html_sha256(body_html)
-                    if prevent_dup:
-                        dup, dup_reason, _ = self.check_duplicate_send_status(
-                            email, body_hash, actual_template
-                        )
-                        if dup and dup_reason in ("same_body_same_sender", "same_template_same_sender"):
-                            self.write_log(
-                                p,
-                                i,
-                                f"🚫 [{idx}/{len(all_rows)}] 스킵: {comp} (동일 계정·동일 본문 재발송) <{email}> 「{actual_template}」",
-                            )
-                            continue
-                    msg = self._build_single_mime(config, s_name, email, final_title, final_body, data, comp)
-                except Exception as e:
-                    self.write_log(p, i, f"❌ [{idx}/{len(all_rows)}] {comp} <{email}> MIME 조립 오류: {e}")
-                    continue
-
-                if need_wait_before_send:
-                    wait_sec = self.get_wait_seconds(interval)
-                    for _ in range(wait_sec):
-                        if self.stop_flags[key]:
-                            break
-                        time.sleep(1)
-                    if self.stop_flags[key]:
-                        break
-
-                try:
-                    success, msg_text = self._send_with_retry(config, msg, max_retries=3)
-                    if success:
-                        self.write_log(p, i, f"✅ [{idx}/{len(all_rows)}] {comp} <{email}> 성공")
-                        self.update_last_sent_state(key, no, comp, email)
-                        eff_tpl = self._effective_template_for_log(actual_template, final_title)
-                        self.record_success_to_db(
-                            key, p, i, comp, email, final_title, actual_template, content_hash=body_hash
-                        )
-                        self.after(0, lambda c=comp, em=email, t=eff_tpl: self._append_cloud_sent_row(c, em, t))
-                        self._update_stats_label()
-                        lbl = self.progress_labels.get(key)
-                        if lbl:
-                            at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            self.after(0, lambda n=no, c=comp, e=email, a=at: lbl.configure(text=f"마지막 성공 전송: {n}행  {c} <{e}>  ({a})"))
-                    else:
-                        self.write_log(p, i, f"❌ [{idx}/{len(all_rows)}] {comp} <{email}> 재시도 실패: {self._translate_smtp_error(msg_text)}")
-                except Exception as e:
-                    self.write_log(p, i, f"❌ [{idx}/{len(all_rows)}] {comp} <{email}> 발송 오류: {self._translate_smtp_error(str(e))}")
-                need_wait_before_send = True
-            self.write_log(p, i, "🏁 모든 작업 종료")
-        finally: self.reset_btns(s_b, st_b)
+                    dt = datetime.fromisoformat(nxt) if nxt else self.business_hours.next_send_window_start()
+                except Exception:
+                    dt = self.business_hours.next_send_window_start()
+                self.write_log(p, i, self.business_hours.format_resume_text(dt))
+                self._set_send_buttons(key, "paused")
+            self._start_campaign_runner(job["job_id"], key, s_b, st_b)
+        except DuplicateActiveCampaignError as e:
+            self.write_log(p, i, "❌ 이미 활성 캠페인이 있어 새 작업을 만들지 않았습니다.")
+            schedule_on_ui(
+                self,
+                lambda: messagebox.showwarning(
+                    "캠페인 중복",
+                    "이미 진행 중이거나 예약 대기 중인 자동발송이 있습니다.",
+                    parent=self,
+                ),
+            )
+        except Exception as e:
+            self.write_log(p, i, f"❌ 작업 오류: {e}")
+        finally:
+            self._start_in_flight[key] = False
+            job_id = self.campaign_job_ids.get(key)
+            job = self.campaign_store.get_job(job_id) if job_id else None
+            st = (job or {}).get("status")
+            if st == JOB_RUNNING:
+                self._set_send_buttons(key, "running")
+            elif st in (JOB_SCHEDULED_PAUSE, JOB_NEEDS_ATTENTION, JOB_QUEUED):
+                self._set_send_buttons(key, "paused")
+            else:
+                self.reset_btns(s_b, st_b)
+                self._set_send_buttons(key, "idle")
+            self._sync_autostart_registry()
+            self._refresh_campaign_ui(key)
 
     def write_log(self, p, i, m):
-        key = f"{p}_{i}"
-        box = self.log_consoles[key]
-        box.configure(state="normal")
-        box.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {m}\n")
-        try:
-            while True:
-                end_idx = box.index("end-1c")
-                line_no = int(float(end_idx.split(".")[0]))
-                if line_no <= LOG_CONSOLE_MAX_LINES:
-                    break
-                box.delete("1.0", "2.0")
-        except Exception:
-            pass
-        box.see("end")
-        box.configure(state="disabled")
+        def _apply():
+            key = f"{p}_{i}"
+            box = self.log_consoles.get(key)
+            if box is None:
+                return
+            try:
+                box.configure(state="normal")
+                box.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {m}\n")
+                while True:
+                    end_idx = box.index("end-1c")
+                    line_no = int(float(end_idx.split(".")[0]))
+                    if line_no <= LOG_CONSOLE_MAX_LINES:
+                        break
+                    box.delete("1.0", "2.0")
+                box.see("end")
+                box.configure(state="disabled")
+            except Exception:
+                return
 
-    def set_stop(self, k): self.stop_flags[k] = True
+        schedule_on_ui(self, _apply)
+
+    def set_stop(self, k):
+        self.stop_flags[k] = True
+        p, i = self._split_task_key(k)
+        self.write_log(p, i, "⏹ 사용자 요청으로 정지합니다. 다음 영업일에 자동 재개되지 않습니다.")
+
+    def set_cancel(self, k):
+        self.campaign_cancel_flags[k] = True
+        self.stop_flags[k] = True
+        p, i = self._split_task_key(k)
+        self.write_log(p, i, "🗑 작업을 취소합니다. 대기열은 더 이상 발송되지 않습니다.")
     def reset_btns(self, s, st): self.after(0, lambda: (s.configure(state="normal"), st.configure(state="disabled", fg_color="#555")))
 
     def _export_to_excel(self, task_key):
@@ -2365,7 +3198,7 @@ class ModernMailSender(ctk.CTk):
         반환: (성공 여부, 성공 시 동기화 건수 / 실패 시 오류 메시지)"""
         if gspread is None:
             return False, "gspread가 설치되어 있지 않습니다. pip install gspread google-auth"
-        cred_path = os.path.join(BASE_DIR, "credentials.json")
+        cred_path = bundled_file("credentials.json")
         if not os.path.exists(cred_path):
             return False, "credentials.json을 찾을 수 없습니다."
         try:
@@ -2443,12 +3276,14 @@ class ModernMailSender(ctk.CTk):
                 return sender_email
         return config.get("id", "")
 
-    def _build_single_mime(self, config, s_name, to_email, final_title, final_body, data, comp):
+    def _build_single_mime(self, config, s_name, to_email, final_title, final_body, data, comp, message_id=None):
         """서버 접속 없이 MIME 메시지 1통 조립. `real_engine`에서 1건씩 조립 후 즉시 발송."""
         msg = MIMEMultipart()
         msg['From'] = formataddr((str(Header(s_name or "운영사무국", 'utf-8')), self._resolve_from_address(config)))
         msg['To'] = to_email
         msg['Subject'] = Header(final_title, 'utf-8')
+        if message_id:
+            msg['Message-ID'] = message_id
         body_html, embedded_imgs = self._process_body_html(final_body, comp)
         msg.attach(MIMEText(body_html, 'html', 'utf-8'))
         for cid, img_data, subtype in embedded_imgs:

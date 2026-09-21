@@ -1,5 +1,22 @@
 # MAIL MONSTER PRO 변경 이력
 
+## [v2.8.1] - 2026-09-21
+
+### 다중 SMTP 계정 동시 자동발송
+- 로그인 사용자당 논리 캠페인은 하나이며, 서로 다른 `task_key` SMTP 계정은 같은 수신자 대기열의 worker로 합류한다.
+- 같은 `task_key`의 중복 시작은 계속 차단한다. 비밀번호·표시 이름이 아니라 `task_key`로 계정을 식별한다.
+- 수신자는 `BEGIN IMMEDIATE`로 원자 claim 하며, 한 캠페인에서 같은 이메일은 한 번만 발송한다. 계정별로 목록을 복제하지 않는다.
+- 계정별 간격·성공/실패·lease·정지/`needs_attention`을 분리한다. 한 계정의 인증 실패가 다른 계정 발송을 막지 않는다.
+- 업무시간(KST 평일·영업일 09:00 이상 18:00 미만)은 모든 worker에 공통 적용. 18:00에 전원 `scheduled_pause`, 다음 영업일 09:00에 정상 worker만 재개.
+- 계정 단위 정지와 캠페인 전체 취소를 모두 유지. PC 재실행 시 현재 로그인 사용자의 활성 worker만 복구. HKCU Run은 기존처럼 프로그램 항목 하나.
+- SMTP 계정 삭제는 해당 `task_key`에 활성 작업이 있을 때만 막는다. 캠페인 DB에 SMTP 비밀번호를 저장하지 않는다.
+- 스키마는 `campaign_workers` 및 queue claim 컬럼을 additive migration으로만 추가한다(기존 DB 삭제 없음). WAL·busy timeout 사용.
+
+### GUI 창 미표시 (로그인 root / parent / grab)
+- 로그인 `mainloop`가 끝난 뒤에 숨겨진 `LoginApp`을 destroy 하고 메인 창을 연다. 네이티브 파일 선택창의 parent는 살아 있는 `ModernMailSender`이다.
+- `UiDialogManager`가 파일·폴더 선택과 `CTkToplevel`을 Tk 메인 스레드에서만 연다. worker는 `after(0)`로만 요청하며 완료를 기다리지 않는다.
+- 영구 `-topmost`를 쓰지 않고, 닫을 때 `grab_release`·플래그 초기화·부모 포커스를 복구한다. 엑셀 파싱과 JSON 저장은 백그라운드에서 수행한다.
+
 ## [v2.8.0] - 2026-09-17
 
 ### 대한민국 영업일 09:00~18:00 자동발송

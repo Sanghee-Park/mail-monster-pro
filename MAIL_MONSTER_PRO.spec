@@ -44,6 +44,8 @@ hiddenimports = [
     'version_compare',
     'smtp_credentials',
     'ui_safe',
+    'ui_dialogs',
+    'recipient_import',
     'login_network',
     'campaign_attachments',
     'campaign_attention',

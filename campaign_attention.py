@@ -13,6 +13,7 @@ from campaign_store import (
     JOB_CANCELLED,
     JOB_COMPLETED,
     JOB_NEEDS_ATTENTION,
+    JOB_QUEUED,
     JOB_RUNNING,
     JOB_SCHEDULED_PAUSE,
     JOB_USER_STOPPED,
@@ -99,7 +100,10 @@ def resolve_review_item(
 
 
 def cancel_campaign(store: CampaignStore, job_id: str, *, now=None) -> str:
-    store.set_status(job_id, JOB_CANCELLED, now=now, clear_runner=True)
+    if hasattr(store, "cancel_campaign_workers"):
+        store.cancel_campaign_workers(job_id, now=now)
+    else:
+        store.set_status(job_id, JOB_CANCELLED, now=now, clear_runner=True)
     return JOB_CANCELLED
 
 
@@ -140,9 +144,15 @@ def maybe_release_attention(
     sending = store.count_by_status(job_id, ITEM_SENDING)
     if pending == 0 and sending == 0:
         store.set_status(job_id, JOB_COMPLETED, now=now, clear_runner=True, attention_reason="")
+        for w in store.list_workers(job_id):
+            if w.get("status") not in (JOB_CANCELLED, JOB_USER_STOPPED):
+                store.update_worker(w["worker_id"], status=JOB_COMPLETED, runner_id=None, lease_until=None)
         return JOB_COMPLETED
     if send_allowed:
         store.set_status(job_id, JOB_RUNNING, now=now, clear_runner=True, attention_reason="")
+        for w in store.list_workers(job_id):
+            if w.get("status") in (JOB_NEEDS_ATTENTION, JOB_SCHEDULED_PAUSE, JOB_QUEUED):
+                store.set_worker_status(w["worker_id"], JOB_RUNNING, now=now, next_resume_at=None, sync_job=False)
         return JOB_RUNNING
     store.set_status(
         job_id,
@@ -152,4 +162,5 @@ def maybe_release_attention(
         clear_runner=True,
         attention_reason="",
     )
+    store.pause_workers_scheduled(job_id, next_resume_at=next_resume_at or "", now=now)
     return JOB_SCHEDULED_PAUSE

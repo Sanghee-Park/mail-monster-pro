@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -160,10 +161,77 @@ def ensure_campaign_schema(con: sqlite3.Connection) -> None:
         "seq": "INTEGER",
         "job_id": "TEXT",
         "message_id": "TEXT",
+        "claimed_by_worker_id": "TEXT",
+        "claimed_by_task_key": "TEXT",
     }
     for name, decl in q_extras.items():
         if name not in q_cols:
             con.execute(f"ALTER TABLE campaign_queue ADD COLUMN {name} {decl}")
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS campaign_workers (
+            worker_id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            login_user_id TEXT NOT NULL DEFAULT '',
+            task_key TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT,
+            updated_at TEXT,
+            next_resume_at TEXT,
+            provider TEXT,
+            account_idx INTEGER,
+            interval_label TEXT,
+            smtp_config_json TEXT,
+            runner_id TEXT,
+            lease_until TEXT,
+            attention_reason TEXT,
+            success_count INTEGER DEFAULT 0,
+            skipped_count INTEGER DEFAULT 0,
+            failed_count INTEGER DEFAULT 0
+        )
+        """
+    )
+    w_cols = {c[1] for c in con.execute("PRAGMA table_info(campaign_workers)").fetchall()}
+    w_extras = {
+        "login_user_id": "TEXT NOT NULL DEFAULT ''",
+        "task_key": "TEXT",
+        "status": "TEXT",
+        "created_at": "TEXT",
+        "updated_at": "TEXT",
+        "next_resume_at": "TEXT",
+        "provider": "TEXT",
+        "account_idx": "INTEGER",
+        "interval_label": "TEXT",
+        "smtp_config_json": "TEXT",
+        "runner_id": "TEXT",
+        "lease_until": "TEXT",
+        "attention_reason": "TEXT",
+        "success_count": "INTEGER DEFAULT 0",
+        "skipped_count": "INTEGER DEFAULT 0",
+        "failed_count": "INTEGER DEFAULT 0",
+    }
+    for name, decl in w_extras.items():
+        if name not in w_cols:
+            con.execute(f"ALTER TABLE campaign_workers ADD COLUMN {name} {decl}")
+    con.execute(
+        """
+        INSERT OR IGNORE INTO campaign_workers(
+            worker_id, job_id, login_user_id, task_key, status, created_at, updated_at,
+            next_resume_at, provider, account_idx, interval_label, smtp_config_json,
+            runner_id, lease_until, attention_reason, success_count, skipped_count, failed_count
+        )
+        SELECT
+            job_id || ':w0', job_id, login_user_id, task_key, status, created_at, updated_at,
+            next_resume_at, provider, account_idx, interval_label, smtp_config_json,
+            runner_id, lease_until, attention_reason, success_count, skipped_count, failed_count
+        FROM campaign_jobs
+        WHERE task_key IS NOT NULL AND task_key != ''
+          AND NOT EXISTS (
+            SELECT 1 FROM campaign_workers w WHERE w.job_id = campaign_jobs.job_id
+          )
+        """
+    )
 
     sent_cols = {c[1] for c in con.execute("PRAGMA table_info(sent_log)").fetchall()}
     if sent_cols and "message_id" not in sent_cols:
@@ -176,6 +244,18 @@ def ensure_campaign_schema(con: sqlite3.Connection) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_campaign_jobs_status ON campaign_jobs(status)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_campaign_queue_job_status ON campaign_queue(job_id, status)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_campaign_queue_job_seq ON campaign_queue(job_id, seq)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_campaign_workers_job ON campaign_workers(job_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_campaign_workers_user_task ON campaign_workers(login_user_id, task_key, status)")
+    try:
+        con.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_campaign_workers_active_user_task
+            ON campaign_workers(login_user_id, task_key)
+            WHERE status IN ('queued','running','scheduled_pause','needs_attention')
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
 
 
 def _scrub_smtp_json_row(raw: Optional[str], task_key: str = "") -> Optional[str]:
@@ -201,6 +281,10 @@ class CampaignStore:
         con = sqlite3.connect(self.db_path, timeout=30)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA busy_timeout=30000")
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error:
+            pass
         return con
 
     def scrub_stored_smtp_secrets(self) -> int:
@@ -218,6 +302,17 @@ class CampaignStore:
                         con.execute(
                             "UPDATE campaign_jobs SET smtp_config_json=? WHERE job_id=?",
                             (new_json, row["job_id"]),
+                        )
+                        n += 1
+                wrows = con.execute("SELECT worker_id, task_key, smtp_config_json FROM campaign_workers").fetchall()
+                for row in wrows:
+                    new_json = _scrub_smtp_json_row(row["smtp_config_json"], row["task_key"] or "")
+                    if new_json is None:
+                        continue
+                    if new_json != (row["smtp_config_json"] or ""):
+                        con.execute(
+                            "UPDATE campaign_workers SET smtp_config_json=? WHERE worker_id=?",
+                            (new_json, row["worker_id"]),
                         )
                         n += 1
                 con.commit()
@@ -254,74 +349,451 @@ class CampaignStore:
         files = list((attachments or {}).get("files") or [])
         imgs = dict((attachments or {}).get("imgs") or {})
         snapshot = public_smtp_snapshot(smtp_config or {}, task_key or "")
+        wid = uuid.uuid4().hex
+        joined = False
         with self._lock:
             con = self._connect()
             try:
                 con.execute("BEGIN IMMEDIATE")
+                uid = login_user_id or ""
+                tkey = task_key or ""
                 if exclusive:
-                    existing = con.execute(
+                    same = con.execute(
                         f"""
-                        SELECT * FROM campaign_jobs
-                        WHERE login_user_id=? AND status IN ({",".join("?" * len(ACTIVE_JOB_STATUSES))})
-                        ORDER BY created_at DESC LIMIT 1
+                        SELECT w.worker_id, w.job_id, w.status, w.task_key
+                        FROM campaign_workers w
+                        WHERE w.login_user_id=? AND w.task_key=?
+                          AND w.status IN (?,?,?)
+                        LIMIT 1
                         """,
-                        (login_user_id or "", *ACTIVE_JOB_STATUSES),
+                        (uid, tkey, JOB_QUEUED, JOB_RUNNING, JOB_SCHEDULED_PAUSE),
                     ).fetchone()
-                    if existing:
+                    if same:
+                        job_row = con.execute(
+                            "SELECT * FROM campaign_jobs WHERE job_id=?",
+                            (same["job_id"],),
+                        ).fetchone()
                         con.rollback()
-                        raise DuplicateActiveCampaignError(dict(existing))
-                con.execute(
-                    """
-                    INSERT INTO campaign_jobs(
-                        job_id, login_user_id, status, created_at, updated_at, next_resume_at,
-                        subject, body, sender_name, task_key, provider, account_idx,
-                        smtp_config_json, interval_label, prevent_dup, apply_public_filter,
-                        template_name, attachments_json, cid_json, total_count,
-                        success_count, skipped_count, failed_count, attention_reason
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        jid,
-                        login_user_id or "",
-                        status,
-                        ts,
-                        ts,
-                        next_resume_at,
-                        subject or "",
-                        body or "",
-                        sender_name or "",
-                        task_key or "",
-                        provider or "",
-                        int(account_idx or 0),
-                        _json_dumps(snapshot),
-                        interval_label or "",
-                        1 if prevent_dup else 0,
-                        1 if apply_public_filter else 0,
-                        template_name or "",
-                        _json_dumps({"files": files, "imgs": imgs}),
-                        _json_dumps(imgs),
-                        len(rows),
-                        0,
-                        0,
-                        0,
-                        None,
-                    ),
-                )
-                for seq, row in enumerate(rows, 1):
-                    row = row if isinstance(row, dict) else {}
-                    email = str(row.get("이메일") or row.get("email") or "").strip()
-                    company = str(row.get("업체명") or row.get("comp") or "")
+                        raise DuplicateActiveCampaignError(dict(job_row) if job_row else dict(same))
+                    reusable = con.execute(
+                        """
+                        SELECT w.worker_id, w.job_id, w.status
+                        FROM campaign_workers w
+                        JOIN campaign_jobs j ON j.job_id = w.job_id
+                        WHERE w.login_user_id=? AND w.task_key=? AND w.status IN (?,?)
+                          AND j.status IN ({placeholders})
+                        ORDER BY w.created_at DESC LIMIT 1
+                        """.format(placeholders=",".join("?" * len(ACTIVE_JOB_STATUSES))),
+                        (uid, tkey, JOB_USER_STOPPED, JOB_NEEDS_ATTENTION, *ACTIVE_JOB_STATUSES),
+                    ).fetchone()
+                    if reusable:
+                        con.execute(
+                            """
+                            UPDATE campaign_workers
+                            SET status=?, updated_at=?, next_resume_at=?, provider=?,
+                                account_idx=?, interval_label=?, smtp_config_json=?,
+                                runner_id=NULL, lease_until=NULL, attention_reason=NULL
+                            WHERE worker_id=?
+                            """,
+                            (
+                                status,
+                                ts,
+                                next_resume_at,
+                                provider or "",
+                                int(account_idx or 0),
+                                interval_label or "",
+                                _json_dumps(snapshot),
+                                reusable["worker_id"],
+                            ),
+                        )
+                        con.commit()
+                        joined = True
+                        jid = reusable["job_id"]
+                        wid = reusable["worker_id"]
+                    else:
+                        other = con.execute(
+                            f"""
+                            SELECT * FROM campaign_jobs
+                            WHERE login_user_id=? AND status IN ({",".join("?" * len(ACTIVE_JOB_STATUSES))})
+                            ORDER BY created_at DESC LIMIT 1
+                            """,
+                            (uid, *ACTIVE_JOB_STATUSES),
+                        ).fetchone()
+                        if other:
+                            jid = other["job_id"]
+                            con.execute(
+                                """
+                                INSERT INTO campaign_workers(
+                                    worker_id, job_id, login_user_id, task_key, status, created_at, updated_at,
+                                    next_resume_at, provider, account_idx, interval_label, smtp_config_json
+                                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                                """,
+                                (
+                                    wid,
+                                    jid,
+                                    uid,
+                                    tkey,
+                                    status,
+                                    ts,
+                                    ts,
+                                    next_resume_at,
+                                    provider or "",
+                                    int(account_idx or 0),
+                                    interval_label or "",
+                                    _json_dumps(snapshot),
+                                ),
+                            )
+                            con.commit()
+                            joined = True
+                if not joined:
                     con.execute(
                         """
-                        INSERT INTO campaign_queue(job_id, seq, recipient_json, email, company, status, attempts)
-                        VALUES (?,?,?,?,?,?,0)
+                        INSERT INTO campaign_jobs(
+                            job_id, login_user_id, status, created_at, updated_at, next_resume_at,
+                            subject, body, sender_name, task_key, provider, account_idx,
+                            smtp_config_json, interval_label, prevent_dup, apply_public_filter,
+                            template_name, attachments_json, cid_json, total_count,
+                            success_count, skipped_count, failed_count, attention_reason
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         """,
-                        (jid, seq, _json_dumps(row), email, company, ITEM_PENDING),
+                        (
+                            jid,
+                            login_user_id or "",
+                            status,
+                            ts,
+                            ts,
+                            next_resume_at,
+                            subject or "",
+                            body or "",
+                            sender_name or "",
+                            task_key or "",
+                            provider or "",
+                            int(account_idx or 0),
+                            _json_dumps(snapshot),
+                            interval_label or "",
+                            1 if prevent_dup else 0,
+                            1 if apply_public_filter else 0,
+                            template_name or "",
+                            _json_dumps({"files": files, "imgs": imgs}),
+                            _json_dumps(imgs),
+                            len(rows),
+                            0,
+                            0,
+                            0,
+                            None,
+                        ),
                     )
+                    for seq, row in enumerate(rows, 1):
+                        row = row if isinstance(row, dict) else {}
+                        email = str(row.get("이메일") or row.get("email") or "").strip()
+                        company = str(row.get("업체명") or row.get("comp") or "")
+                        con.execute(
+                            """
+                            INSERT INTO campaign_queue(job_id, seq, recipient_json, email, company, status, attempts)
+                            VALUES (?,?,?,?,?,?,0)
+                            """,
+                            (jid, seq, _json_dumps(row), email, company, ITEM_PENDING),
+                        )
+                    con.execute(
+                        """
+                        INSERT INTO campaign_workers(
+                            worker_id, job_id, login_user_id, task_key, status, created_at, updated_at,
+                            next_resume_at, provider, account_idx, interval_label, smtp_config_json
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            wid,
+                            jid,
+                            login_user_id or "",
+                            task_key or "",
+                            status,
+                            ts,
+                            ts,
+                            next_resume_at,
+                            provider or "",
+                            int(account_idx or 0),
+                            interval_label or "",
+                            _json_dumps(snapshot),
+                        ),
+                    )
+                    con.commit()
+            finally:
+                con.close()
+        job = self.get_job(jid) or {}
+        job["worker_id"] = wid
+        job["joined_existing"] = joined
+        return job
+
+    def get_worker(self, worker_id: str) -> Optional[dict]:
+        with self._lock:
+            con = self._connect()
+            try:
+                row = con.execute("SELECT * FROM campaign_workers WHERE worker_id=?", (worker_id,)).fetchone()
+                return dict(row) if row else None
+            finally:
+                con.close()
+
+    def list_workers(self, job_id: str) -> List[dict]:
+        with self._lock:
+            con = self._connect()
+            try:
+                rows = con.execute(
+                    "SELECT * FROM campaign_workers WHERE job_id=? ORDER BY created_at",
+                    (job_id,),
+                ).fetchall()
+                return [dict(r) for r in rows]
+            finally:
+                con.close()
+
+    def find_active_worker(self, login_user_id: str, task_key: str) -> Optional[dict]:
+        with self._lock:
+            con = self._connect()
+            try:
+                row = con.execute(
+                    f"""
+                    SELECT * FROM campaign_workers
+                    WHERE login_user_id=? AND task_key=?
+                      AND status IN ({",".join("?" * len(ACTIVE_JOB_STATUSES))})
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (login_user_id or "", task_key or "", *ACTIVE_JOB_STATUSES),
+                ).fetchone()
+                return dict(row) if row else None
+            finally:
+                con.close()
+
+    def list_resumable_workers(self, login_user_id: str) -> List[dict]:
+        with self._lock:
+            con = self._connect()
+            try:
+                rows = con.execute(
+                    f"""
+                    SELECT * FROM campaign_workers
+                    WHERE login_user_id=? AND status IN ({",".join("?" * len(RESUME_JOB_STATUSES))})
+                    ORDER BY created_at
+                    """,
+                    (login_user_id or "", *RESUME_JOB_STATUSES),
+                ).fetchall()
+                return [dict(r) for r in rows]
+            finally:
+                con.close()
+
+    def list_attention_workers(self, login_user_id: str) -> List[dict]:
+        with self._lock:
+            con = self._connect()
+            try:
+                rows = con.execute(
+                    """
+                    SELECT * FROM campaign_workers
+                    WHERE login_user_id=? AND status=?
+                    ORDER BY created_at
+                    """,
+                    (login_user_id or "", JOB_NEEDS_ATTENTION),
+                ).fetchall()
+                return [dict(r) for r in rows]
+            finally:
+                con.close()
+
+    def primary_worker_id(self, job_id: str, task_key: Optional[str] = None) -> Optional[str]:
+        workers = self.list_workers(job_id)
+        if task_key:
+            for w in workers:
+                if (w.get("task_key") or "") == task_key:
+                    return w.get("worker_id")
+        return workers[0]["worker_id"] if workers else None
+
+    def update_worker(self, worker_id: str, **fields) -> None:
+        if not fields:
+            return
+        fields = dict(fields)
+        fields["updated_at"] = fields.get("updated_at") or _now_iso()
+        cols = ", ".join(f"{k}=?" for k in fields)
+        vals = list(fields.values()) + [worker_id]
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute(f"UPDATE campaign_workers SET {cols} WHERE worker_id=?", vals)
                 con.commit()
             finally:
                 con.close()
-        return self.get_job(jid)
+
+    def set_worker_status(
+        self,
+        worker_id: str,
+        status: str,
+        *,
+        next_resume_at: Optional[str] = None,
+        now: Optional[datetime] = None,
+        clear_runner: bool = False,
+        attention_reason: Optional[str] = None,
+        sync_job: bool = True,
+    ) -> None:
+        fields: Dict[str, Any] = {"status": status, "updated_at": _now_iso(now)}
+        if next_resume_at is not None:
+            fields["next_resume_at"] = next_resume_at
+        elif status != JOB_SCHEDULED_PAUSE:
+            fields["next_resume_at"] = None
+        if attention_reason is not None:
+            fields["attention_reason"] = attention_reason
+        elif status not in (JOB_NEEDS_ATTENTION,):
+            fields["attention_reason"] = None
+        if clear_runner or status in (
+            JOB_COMPLETED,
+            JOB_CANCELLED,
+            JOB_USER_STOPPED,
+            JOB_SCHEDULED_PAUSE,
+            JOB_NEEDS_ATTENTION,
+        ):
+            fields["runner_id"] = None
+            fields["lease_until"] = None
+        self.update_worker(worker_id, **fields)
+        if sync_job:
+            worker = self.get_worker(worker_id) or {}
+            jid = worker.get("job_id")
+            if jid:
+                self.sync_job_status_from_workers(jid, now=now)
+
+    def set_needs_attention_worker(self, worker_id: str, reason: str, *, now: Optional[datetime] = None) -> None:
+        self.set_worker_status(
+            worker_id,
+            JOB_NEEDS_ATTENTION,
+            now=now,
+            clear_runner=True,
+            attention_reason=reason or "사용자 확인이 필요합니다.",
+        )
+
+    def pause_workers_scheduled(self, job_id: str, *, next_resume_at: str, now: Optional[datetime] = None) -> None:
+        for w in self.list_workers(job_id):
+            if w.get("status") in (JOB_RUNNING, JOB_QUEUED, JOB_SCHEDULED_PAUSE):
+                self.set_worker_status(
+                    w["worker_id"],
+                    JOB_SCHEDULED_PAUSE,
+                    next_resume_at=next_resume_at,
+                    now=now,
+                    clear_runner=True,
+                    sync_job=False,
+                )
+        self.set_status(job_id, JOB_SCHEDULED_PAUSE, next_resume_at=next_resume_at, now=now, clear_runner=True)
+
+    def resume_workers_for_window(self, job_id: str, *, now: Optional[datetime] = None) -> None:
+        for w in self.list_workers(job_id):
+            if w.get("status") in (JOB_SCHEDULED_PAUSE, JOB_QUEUED, JOB_RUNNING):
+                self.set_worker_status(
+                    w["worker_id"], JOB_RUNNING, next_resume_at=None, now=now, sync_job=False
+                )
+        self.set_status(job_id, JOB_RUNNING, next_resume_at=None, now=now)
+
+    def cancel_campaign_workers(self, job_id: str, *, now: Optional[datetime] = None) -> None:
+        for w in self.list_workers(job_id):
+            if w.get("status") not in (JOB_COMPLETED, JOB_CANCELLED):
+                self.set_worker_status(w["worker_id"], JOB_CANCELLED, now=now, clear_runner=True, sync_job=False)
+        self.set_status(job_id, JOB_CANCELLED, now=now, clear_runner=True)
+
+    def sync_job_status_from_workers(self, job_id: str, *, now: Optional[datetime] = None) -> str:
+        job = self.get_job(job_id) or {}
+        if job.get("status") in (JOB_CANCELLED, JOB_COMPLETED):
+            return job["status"]
+        pending = self.count_by_status(job_id, ITEM_PENDING)
+        sending = self.count_by_status(job_id, ITEM_SENDING)
+        review = self.count_by_status(job_id, ITEM_NEEDS_REVIEW)
+        workers = self.list_workers(job_id)
+        if pending == 0 and sending == 0:
+            if review > 0:
+                if job.get("status") != JOB_NEEDS_ATTENTION:
+                    self.set_status(
+                        job_id,
+                        JOB_NEEDS_ATTENTION,
+                        now=now,
+                        clear_runner=True,
+                        attention_reason=f"확인이 필요한 수신자가 {review}건 남아 있습니다.",
+                    )
+                return JOB_NEEDS_ATTENTION
+            self.set_status(job_id, JOB_COMPLETED, now=now, clear_runner=True)
+            for w in workers:
+                if w.get("status") not in (JOB_CANCELLED, JOB_USER_STOPPED, JOB_NEEDS_ATTENTION):
+                    self.update_worker(w["worker_id"], status=JOB_COMPLETED, runner_id=None, lease_until=None)
+            return JOB_COMPLETED
+        statuses = [w.get("status") for w in workers]
+        if any(s == JOB_RUNNING for s in statuses):
+            if job.get("status") != JOB_RUNNING:
+                self.set_status(job_id, JOB_RUNNING, now=now)
+            return JOB_RUNNING
+        if any(s == JOB_SCHEDULED_PAUSE for s in statuses):
+            nxt = next((w.get("next_resume_at") for w in workers if w.get("next_resume_at")), job.get("next_resume_at"))
+            if job.get("status") != JOB_SCHEDULED_PAUSE:
+                self.set_status(job_id, JOB_SCHEDULED_PAUSE, next_resume_at=nxt, now=now, clear_runner=True)
+            return JOB_SCHEDULED_PAUSE
+        if any(s == JOB_QUEUED for s in statuses):
+            return JOB_QUEUED
+        if any(s == JOB_NEEDS_ATTENTION for s in statuses) and pending > 0:
+            runnable = any(s in (JOB_RUNNING, JOB_QUEUED, JOB_SCHEDULED_PAUSE) for s in statuses)
+            if not runnable and job.get("status") != JOB_NEEDS_ATTENTION:
+                self.set_status(job_id, JOB_NEEDS_ATTENTION, now=now, clear_runner=True)
+            return JOB_NEEDS_ATTENTION if not runnable else (job.get("status") or JOB_RUNNING)
+        if statuses and all(s in (JOB_USER_STOPPED, JOB_CANCELLED, JOB_COMPLETED) for s in statuses):
+            if all(s == JOB_USER_STOPPED for s in statuses) or any(s == JOB_USER_STOPPED for s in statuses):
+                self.set_status(job_id, JOB_USER_STOPPED, now=now, clear_runner=True)
+                return JOB_USER_STOPPED
+        return job.get("status") or JOB_RUNNING
+
+    def worker_stats(self, job_id: str, worker_id: Optional[str] = None, task_key: Optional[str] = None) -> dict:
+        job = self.refresh_counts(job_id) or {}
+        worker = None
+        if worker_id:
+            worker = self.get_worker(worker_id)
+        elif task_key:
+            for w in self.list_workers(job_id):
+                if (w.get("task_key") or "") == task_key:
+                    worker = w
+                    break
+        if worker:
+            sent = int(worker.get("success_count") or 0)
+            skipped = int(worker.get("skipped_count") or 0)
+            failed = int(worker.get("failed_count") or 0)
+            st = worker.get("status") or job.get("status")
+            nxt = worker.get("next_resume_at") or job.get("next_resume_at")
+            reason = worker.get("attention_reason") or job.get("attention_reason") or ""
+        else:
+            sent = int(job.get("success_count") or 0)
+            skipped = int(job.get("skipped_count") or 0)
+            failed = int(job.get("failed_count") or 0)
+            st = job.get("status")
+            nxt = job.get("next_resume_at")
+            reason = job.get("attention_reason") or ""
+        return {
+            "job_id": job_id,
+            "worker_id": (worker or {}).get("worker_id") or "",
+            "task_key": (worker or {}).get("task_key") or job.get("task_key") or "",
+            "status": st,
+            "next_resume_at": nxt,
+            "attention_reason": reason,
+            "total": int(job.get("total_count") or 0),
+            "success": sent,
+            "skipped": skipped,
+            "failed": failed,
+            "campaign_success": int(job.get("success_count") or 0),
+            "campaign_skipped": int(job.get("skipped_count") or 0),
+            "campaign_failed": int(job.get("failed_count") or 0),
+            "remaining": int(job.get("pending_count") or 0),
+            "needs_review": int(job.get("needs_review_count") or 0),
+        }
+
+    def bump_worker_result(self, worker_id: Optional[str], kind: str) -> None:
+        if not worker_id:
+            return
+        col = {"sent": "success_count", "skipped": "skipped_count", "failed": "failed_count"}.get(kind)
+        if not col:
+            return
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute(
+                    f"UPDATE campaign_workers SET {col}={col}+1, updated_at=? WHERE worker_id=?",
+                    (_now_iso(), worker_id),
+                )
+                con.commit()
+            finally:
+                con.close()
 
     def get_job(self, job_id: str) -> Optional[dict]:
         with self._lock:
@@ -383,7 +855,7 @@ class CampaignStore:
             try:
                 if task_key:
                     row = con.execute(
-                        f"SELECT 1 FROM campaign_jobs WHERE login_user_id=? AND task_key=? AND status IN ({','.join('?' * len(ACTIVE_JOB_STATUSES))}) LIMIT 1",
+                        f"SELECT 1 FROM campaign_workers WHERE login_user_id=? AND task_key=? AND status IN ({','.join('?' * len(ACTIVE_JOB_STATUSES))}) LIMIT 1",
                         (login_user_id or "", task_key, *ACTIVE_JOB_STATUSES),
                     ).fetchone()
                 else:
@@ -411,7 +883,18 @@ class CampaignStore:
             finally:
                 con.close()
 
-    def find_blocking_job(self, login_user_id: str) -> Optional[dict]:
+    def find_blocking_job(self, login_user_id: str, task_key: Optional[str] = None) -> Optional[dict]:
+        uid = login_user_id or ""
+        if task_key:
+            worker = self.find_active_worker(uid, task_key)
+            if not worker:
+                return None
+            job = self.get_job(worker["job_id"])
+            if not job:
+                return dict(worker)
+            job["worker_id"] = worker["worker_id"]
+            job["worker_status"] = worker.get("status")
+            return job
         jobs = self.list_active_jobs(login_user_id)
         return jobs[0] if jobs else None
 
@@ -556,47 +1039,108 @@ class CampaignStore:
             finally:
                 con.close()
 
-    def claim_next_pending(self, job_id: str, *, message_id: Optional[str] = None) -> Optional[dict]:
-        """pending → sending 을 한 트랜잭션에서 수행해 이중 발송을 막는다."""
+    def claim_next_pending(
+        self,
+        job_id: str,
+        *,
+        message_id: Optional[str] = None,
+        worker_id: Optional[str] = None,
+        task_key: Optional[str] = None,
+        retries: int = 8,
+    ) -> Optional[dict]:
+        """pending → sending 을 BEGIN IMMEDIATE 트랜잭션에서 수행해 이중 발송을 막는다."""
+        last_lock = False
+        for attempt in range(max(1, int(retries))):
+            item, locked = self._claim_next_pending_once(
+                job_id, message_id=message_id, worker_id=worker_id, task_key=task_key
+            )
+            if not locked:
+                return item
+            last_lock = True
+            time.sleep(0.02 * (attempt + 1))
+        return None if last_lock else None
+
+    def _claim_next_pending_once(
+        self,
+        job_id: str,
+        *,
+        message_id: Optional[str] = None,
+        worker_id: Optional[str] = None,
+        task_key: Optional[str] = None,
+    ) -> tuple:
         with self._lock:
             con = self._connect()
             try:
                 con.execute("BEGIN IMMEDIATE")
                 row = con.execute(
                     """
-                    SELECT * FROM campaign_queue
-                    WHERE job_id=? AND status=?
-                    ORDER BY seq ASC LIMIT 1
+                    SELECT * FROM campaign_queue q
+                    WHERE q.job_id=? AND q.status=?
+                      AND (
+                        q.email IS NULL OR TRIM(q.email) = ''
+                        OR NOT EXISTS (
+                          SELECT 1 FROM campaign_queue o
+                          WHERE o.job_id = q.job_id
+                            AND LOWER(o.email) = LOWER(q.email)
+                            AND o.status IN (?,?,?,?,?)
+                        )
+                      )
+                    ORDER BY q.seq ASC LIMIT 1
                     """,
-                    (job_id, ITEM_PENDING),
+                    (
+                        job_id,
+                        ITEM_PENDING,
+                        ITEM_SENDING,
+                        ITEM_SENT,
+                        ITEM_SKIPPED,
+                        ITEM_FAILED,
+                        ITEM_NEEDS_REVIEW,
+                    ),
                 ).fetchone()
                 if not row:
                     con.commit()
-                    return None
+                    return None, False
                 item = dict(row)
                 mid = message_id or campaign_message_id(job_id, int(item["id"]), int(item.get("seq") or 0))
                 cur = con.execute(
                     """
                     UPDATE campaign_queue
-                    SET status=?, message_id=?, processed_at=?
+                    SET status=?, message_id=?, processed_at=?,
+                        claimed_by_worker_id=?, claimed_by_task_key=?
                     WHERE id=? AND status=?
                     """,
-                    (ITEM_SENDING, mid, _now_iso(), item["id"], ITEM_PENDING),
+                    (
+                        ITEM_SENDING,
+                        mid,
+                        _now_iso(),
+                        worker_id or "",
+                        task_key or "",
+                        item["id"],
+                        ITEM_PENDING,
+                    ),
                 )
                 if not cur.rowcount:
                     con.rollback()
-                    return None
+                    return None, True
                 con.commit()
                 item["status"] = ITEM_SENDING
                 item["message_id"] = mid
+                item["claimed_by_worker_id"] = worker_id or ""
+                item["claimed_by_task_key"] = task_key or ""
                 item["recipient"] = _json_loads(item.get("recipient_json"), {})
-                return item
+                return item, False
+            except sqlite3.OperationalError:
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
+                return None, True
             except Exception:
                 try:
                     con.rollback()
                 except Exception:
                     pass
-                return None
+                return None, False
             finally:
                 con.close()
 
@@ -655,6 +1199,16 @@ class CampaignStore:
                         return {"reset": 0, "sent": 0, "review": 0, "skipped_live": 1}
                 except Exception:
                     pass
+            live_workers = set()
+            for w in self.list_workers(job_id):
+                if self._lease_is_live(w, now):
+                    live_workers.add(w.get("worker_id"))
+        else:
+            live_workers = set()
+            for job in self.list_active_jobs():
+                for w in self.list_workers(job["job_id"]):
+                    if self._lease_is_live(w, now):
+                        live_workers.add(w.get("worker_id"))
         stats = {"reset": 0, "sent": 0, "review": 0}
         with self._lock:
             con = self._connect()
@@ -673,6 +1227,9 @@ class CampaignStore:
                 for row in rows:
                     item = dict(row)
                     item["recipient"] = _json_loads(item.get("recipient_json"), {})
+                    claimed_w = (item.get("claimed_by_worker_id") or "").strip()
+                    if claimed_w and claimed_w in live_workers:
+                        continue
                     jid = item.get("job_id")
                     touched_jobs.add(jid)
                     attempts = int(item.get("attempts") or 0)
@@ -823,6 +1380,132 @@ class CampaignStore:
             finally:
                 con.close()
 
+    def _lease_is_live(self, row: Optional[dict], now: Optional[datetime] = None) -> bool:
+        if not row:
+            return False
+        rid = (row.get("runner_id") or "").strip()
+        lease_until = row.get("lease_until") or ""
+        if not rid or not lease_until:
+            return False
+        try:
+            return as_kst(datetime.fromisoformat(lease_until)) > as_kst(now)
+        except Exception:
+            return False
+
+    def try_claim_worker(
+        self,
+        worker_id: str,
+        owner: str,
+        *,
+        now: Optional[datetime] = None,
+        lease_seconds: int = 180,
+        allowed_statuses: Iterable[str] = RESUME_JOB_STATUSES,
+    ) -> bool:
+        now_dt = as_kst(now)
+        lease = (now_dt + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds")
+        now_s = now_dt.isoformat(timespec="seconds")
+        allowed = list(allowed_statuses)
+        placeholders = ",".join("?" * len(allowed))
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                row = con.execute(
+                    "SELECT runner_id, lease_until, status FROM campaign_workers WHERE worker_id=?",
+                    (worker_id,),
+                ).fetchone()
+                if not row:
+                    con.rollback()
+                    return False
+                if row["status"] not in allowed:
+                    con.rollback()
+                    return False
+                rid = (row["runner_id"] or "").strip()
+                lease_until = row["lease_until"] or ""
+                expired = True
+                if rid and lease_until:
+                    try:
+                        expired = as_kst(datetime.fromisoformat(lease_until)) <= now_dt
+                    except Exception:
+                        expired = True
+                if rid and rid != owner and not expired:
+                    con.rollback()
+                    return False
+                con.execute(
+                    f"""
+                    UPDATE campaign_workers
+                    SET runner_id=?, lease_until=?, updated_at=?
+                    WHERE worker_id=? AND status IN ({placeholders})
+                    """,
+                    [owner, lease, now_s, worker_id, *allowed],
+                )
+                con.commit()
+                return True
+            except sqlite3.OperationalError:
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
+                return False
+            except Exception:
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
+                return False
+            finally:
+                con.close()
+
+    def has_live_worker_lease(
+        self, worker_id: str, *, now: Optional[datetime] = None, owner: Optional[str] = None
+    ) -> bool:
+        now_dt = as_kst(now)
+        worker = self.get_worker(worker_id) or {}
+        rid = (worker.get("runner_id") or "").strip()
+        if not rid:
+            return False
+        if owner and rid == owner:
+            return False
+        return self._lease_is_live(worker, now_dt)
+
+    def heartbeat_worker(
+        self, worker_id: str, owner: str, *, now: Optional[datetime] = None, lease_seconds: int = 180
+    ) -> None:
+        now_dt = as_kst(now)
+        lease = (now_dt + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds")
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute(
+                    "UPDATE campaign_workers SET lease_until=?, updated_at=? WHERE worker_id=? AND runner_id=?",
+                    (lease, _now_iso(now_dt), worker_id, owner),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+    def release_worker(self, worker_id: str, owner: Optional[str] = None) -> None:
+        with self._lock:
+            con = self._connect()
+            try:
+                if owner:
+                    con.execute(
+                        "UPDATE campaign_workers SET runner_id=NULL, lease_until=NULL, updated_at=? WHERE worker_id=? AND runner_id=?",
+                        (_now_iso(), worker_id, owner),
+                    )
+                else:
+                    con.execute(
+                        "UPDATE campaign_workers SET runner_id=NULL, lease_until=NULL, updated_at=? WHERE worker_id=?",
+                        (_now_iso(), worker_id),
+                    )
+                con.commit()
+            finally:
+                con.close()
+
+    def worker_smtp_config(self, worker: dict) -> dict:
+        cfg = _json_loads((worker or {}).get("smtp_config_json"), {}) or {}
+        return cfg if isinstance(cfg, dict) else {}
+
     def has_live_lease(self, job_id: str, *, now: Optional[datetime] = None, owner: Optional[str] = None) -> bool:
         """다른 실행자가 유효한 lease를 갖고 있으면 True. 자기 owner이면 False."""
         now_dt = as_kst(now)
@@ -887,7 +1570,9 @@ class CampaignStore:
     def any_active_on_pc(self) -> bool:
         return bool(self.list_active_jobs())
 
-    def stats_dict(self, job_id: str) -> dict:
+    def stats_dict(self, job_id: str, worker_id: Optional[str] = None, task_key: Optional[str] = None) -> dict:
+        if worker_id or task_key:
+            return self.worker_stats(job_id, worker_id=worker_id, task_key=task_key)
         job = self.refresh_counts(job_id) or {}
         remaining = int(job.get("pending_count") or 0)
         return {

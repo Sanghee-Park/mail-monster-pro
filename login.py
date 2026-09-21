@@ -27,7 +27,7 @@ BASE_DIR = install_dir()
 CREDENTIALS_FILE = bundled_file("credentials.json")
 
 # Phase 8 Task 8-x: 구글 시트 버전과 비교할 앱 현재 버전
-CURRENT_VERSION = "v2.8.1"
+CURRENT_VERSION = "v2.8.2"
 SPREADSHEET_KEY = "1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw"
 
 # GitHub 릴리스 연동: 시트 B1이 비어 있거나 "GITHUB"이면 최신 Release의 .exe URL 사용 (구글 드라이브 불필요)

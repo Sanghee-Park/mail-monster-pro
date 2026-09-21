@@ -1,4 +1,4 @@
-# MAIL MONSTER PRO — 운영 배포 체크리스트 (v2.8.1 기준)
+# MAIL MONSTER PRO — 운영 배포 체크리스트 (v2.8.2 기준)
 
 ## 1. 버전 한 곳에서 맞추기
 
@@ -6,10 +6,10 @@
 
 | 위치 | 형식 예 |
 |------|---------|
-| `login.py` → `CURRENT_VERSION` | `v2.8.1` |
-| `installer/MAIL_MONSTER_PRO.iss` → `#define MyAppVersion` | `2.8.1` (v 없음) |
-| 구글 시트 `설정` **A1** | `v2.8.1` (사용자에게 보이는 최신 버전) |
-| Git 태그 | `v2.8.1` |
+| `login.py` → `CURRENT_VERSION` | `v2.8.2` |
+| `installer/MAIL_MONSTER_PRO.iss` → `#define MyAppVersion` | `2.8.2` (v 없음) |
+| 구글 시트 `설정` **A1** | `v2.8.2` (사용자에게 보이는 최신 버전) |
+| Git 태그 | `v2.8.2` |
 
 ## 2. 로컬 패키징 (Windows)
 
@@ -31,10 +31,10 @@
 
 ```bash
 git add -A
-git commit -m "release: v2.8.1"
-git tag v2.8.1
+git commit -m "release: v2.8.2"
+git tag v2.8.2
 git push origin main
-git push origin v2.8.1
+git push origin v2.8.2
 ```
 
 2. Actions **Build and Release** 가 `MAIL_MONSTER_PRO.exe` + `.sha256` 을 Release에 올립니다.

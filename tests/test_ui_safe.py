@@ -42,6 +42,11 @@ class UiSafeTests(unittest.TestCase):
         schedule_on_ui(root, lambda: ran.append(1))
         self.assertEqual(ran, [])
 
+    def test_callback_exception_is_logged_not_swallowed_silently(self):
+        root = FakeRoot()
+        schedule_on_ui(root, lambda: 1 / 0)
+        self.assertTrue(getattr(root, "_last_ui_error", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,5 @@
 import customtkinter as ctk
-from tkinter import ttk, filedialog, messagebox, simpledialog, Menu
+from tkinter import ttk, messagebox, Menu
 import gc, hashlib, json, os, sys, random, sqlite3, re, base64
 import smtplib, threading, time, mimetypes
 import tempfile, webbrowser
@@ -57,6 +57,8 @@ from app_paths import (
 )
 from smtp_credentials import public_smtp_snapshot, resolve_smtp_for_send, snapshot_contains_secrets
 from ui_safe import schedule_on_ui
+from ui_dialogs import UiDialogManager, live_ui_parent, is_usable_parent, is_widget_alive
+from recipient_import import parse_recipient_excel_files, start_excel_import
 
 # 블랙리스트 관리 모듈 (Task 5-1)
 try:
@@ -212,12 +214,12 @@ def _parse_sender_profile_from_entry(entry):
 
 
 CAMPAIGN_STATUS_KO = {
-    JOB_QUEUED: "작업 등록 완료",
-    JOB_RUNNING: "발송 중",
-    JOB_SCHEDULED_PAUSE: "업무시간 외 자동 대기",
+    JOB_QUEUED: "대기",
+    JOB_RUNNING: "실행 중",
+    JOB_SCHEDULED_PAUSE: "예약 대기",
     JOB_USER_STOPPED: "사용자 정지",
-    JOB_NEEDS_ATTENTION: "사용자 확인 필요",
-    JOB_COMPLETED: "전체 처리 완료",
+    JOB_NEEDS_ATTENTION: "확인 필요",
+    JOB_COMPLETED: "완료",
     JOB_CANCELLED: "작업 취소",
 }
 
@@ -239,6 +241,7 @@ class ModernMailSender(ctk.CTk):
         self.db_path = paths["sent_history.db"]
         self.log_consoles, self.stop_flags, self.tree_views, self.progress_labels = {}, {}, {}, {}
         self.campaign_ui, self.campaign_buttons, self.campaign_job_ids = {}, {}, {}
+        self.campaign_worker_ids = {}
         self.campaign_cancel_flags = {}
         self._smtp_account_entries = {}
         self.current_template_name = {}
@@ -254,12 +257,23 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.8.0"
+            CURRENT_VERSION = "v2.8.1"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686")  # 기본 크기
         self.minsize(800, 520)  # 축소 시 레이아웃 붕괴·버튼 소실 방지
         ctk.set_appearance_mode("dark")
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        try:
+            import tkinter as _tk
+
+            _tk._default_root = self
+        except Exception:
+            pass
+        self.dialogs = UiDialogManager(
+            lambda: self,
+            ui_thread_id=threading.get_ident(),
+            show_error=lambda msg, tb: self._show_dialog_error(msg, tb),
+        )
         
         if not os.path.exists(self.config_file):
             self._atomic_write_json_path(self.config_file, {}, indent=4, ensure_ascii=False)
@@ -381,6 +395,109 @@ class ModernMailSender(ctk.CTk):
             state["headers"] = headers
         data[task_key] = state
         self._write_recipients_state_all(data)
+
+    def _show_dialog_error(self, msg, tb=""):
+        parent = live_ui_parent(self)
+        try:
+            messagebox.showerror("오류", str(msg or "오류가 발생했습니다."), parent=parent if is_usable_parent(parent) else None)
+        except Exception:
+            pass
+        if tb:
+            try:
+                setattr(self, "_last_ui_error", tb)
+            except Exception:
+                pass
+
+    def _close_managed_window(self, win, key):
+        self.dialogs.close_toplevel(win, key=key)
+
+    def pick_folder_dialog(self, **kwargs):
+        return self.dialogs.askdirectory(key=kwargs.pop("key", "pick_folder"), **kwargs)
+
+    def _choose_excel_paths(self):
+        return self.dialogs.askopenfilenames(
+            key="excel_recipients",
+            title="수신처 엑셀 파일 선택",
+            filetypes=[("Excel Files", "*.xlsx *.xls *.csv")],
+        )
+
+    def _on_load_excel_clicked(self, task_key, tree, update_count_label):
+        start_no = 1
+        try:
+            start_no = len(tree.get_children()) + 1
+        except Exception:
+            start_no = 1
+
+        def parse_and_save(paths):
+            parsed = parse_recipient_excel_files(paths)
+            parsed["start_no"] = start_no
+            if parsed.get("loaded_files"):
+                state = self.load_recipients_state(task_key)
+                existing_rows = list(state.get("rows", []))
+                merged_headers = list(state.get("headers", []))
+                for col in parsed.get("headers") or []:
+                    if col not in merged_headers:
+                        merged_headers.append(col)
+                combined = existing_rows + list(parsed.get("rows") or [])
+                self.save_recipients_rows(task_key, combined, merged_headers)
+                parsed["combined_count"] = len(combined)
+            return parsed
+
+        def apply_on_ui(result):
+            schedule_on_ui(
+                self,
+                lambda r=result: self._apply_excel_import_result(task_key, tree, update_count_label, r),
+            )
+
+        return start_excel_import(
+            dialogs=self.dialogs,
+            parse_fn=parse_and_save,
+            apply_on_ui=apply_on_ui,
+            key="excel_recipients",
+            title="수신처 엑셀 파일 선택",
+            filetypes=[("Excel Files", "*.xlsx *.xls *.csv")],
+        )
+
+    def _apply_excel_import_result(self, task_key, tree, update_count_label, result):
+        result = result or {}
+        if result.get("error"):
+            self._show_dialog_error("엑셀 파일을 처리하는 중 오류가 발생했습니다.", result.get("error"))
+            return
+        if not result.get("loaded_files"):
+            detail = "\n".join((result.get("failed_files") or [])[:5])
+            parent = live_ui_parent(self)
+            messagebox.showerror(
+                "불러오기 실패",
+                f"선택한 파일을 읽지 못했습니다.\n{detail}",
+                parent=parent if is_usable_parent(parent) else None,
+            )
+            return
+        try:
+            if tree is None or not is_widget_alive(tree):
+                if callable(update_count_label):
+                    update_count_label()
+                return
+            start = int(result.get("start_no") or (len(tree.get_children()) + 1))
+            for i, row in enumerate(result.get("rows") or [], start=start):
+                if not isinstance(row, dict):
+                    continue
+                comp = row.get("업체명") or row.get("comp") or ""
+                email = row.get("이메일") or row.get("email") or ""
+                tree.insert("", "end", values=(i, comp, email))
+            if callable(update_count_label):
+                update_count_label()
+        except Exception:
+            self._show_dialog_error("수신처 목록을 화면에 반영하지 못했습니다.")
+            return
+        failed_files = result.get("failed_files") or []
+        if failed_files:
+            detail = "\n".join(failed_files[:5])
+            parent = live_ui_parent(self)
+            messagebox.showwarning(
+                "일부 파일 실패",
+                f"{result.get('loaded_files')}개 파일은 추가되었고, {len(failed_files)}개 파일은 실패했습니다.\n{detail}",
+                parent=parent if is_usable_parent(parent) else None,
+            )
 
     def update_last_sent_state(self, task_key, no, comp, email):
         data = self._read_recipients_state_all()
@@ -883,7 +1000,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.8.0"
+            _ver = "v2.8.1"
 
         title_lbl = ctk.CTkLabel(
             header,
@@ -1143,11 +1260,11 @@ class ModernMailSender(ctk.CTk):
             messagebox.showinfo("안내", "연동된 계정만 별칭을 설정할 수 있습니다.", parent=self)
             return
         cur = (ent.get("display_name") or "").strip()
-        new_name = simpledialog.askstring(
+        new_name = self.dialogs.askstring(
             "표시 이름",
             "사이드바에 표시할 별칭(비우면 아이디 표기로 복귀):",
+            key="rename_account",
             initialvalue=cur,
-            parent=self,
         )
         if new_name is None:
             return
@@ -1205,7 +1322,7 @@ class ModernMailSender(ctk.CTk):
         if not login_id:
             messagebox.showinfo("안내", "이 슬롯에는 저장된 SMTP 계정이 없습니다.", parent=self)
             return
-        if self.campaign_store and self.campaign_store.has_active_job_for_user(self.login_user_id):
+        if self.campaign_store and self.campaign_store.has_active_job_for_user(self.login_user_id, task_key):
             messagebox.showwarning(
                 "계정 삭제 불가",
                 "진행 중이거나 예약 대기 중인 자동발송 작업이 있어 계정을 삭제할 수 없습니다.\n"
@@ -1368,15 +1485,13 @@ class ModernMailSender(ctk.CTk):
 
     def _open_user_profile_popup(self):
         """로그인 사용자 단일 프로필 편집 팝업."""
-        pop = ctk.CTkToplevel(self)
-        pop.title("내 프로필")
-        pop.geometry("430x420")
-        pop.minsize(320, 380)
-        pop.attributes("-topmost", True)
-        try:
-            pop.transient(self)
-        except Exception:
-            pass
+        key = "user_profile"
+        pop = self.dialogs.open_toplevel(key, title="내 프로필", geometry="430x420", minsize=(320, 380), modal=False)
+        if pop is None:
+            return
+        if getattr(pop, "_ui_dialog_built", False):
+            return
+        pop._ui_dialog_built = True
 
         profile = self.get_login_user_profile()
         ctk.CTkLabel(pop, text=f"로그인 사용자: {self.user_name}", font=self._font_small, text_color="#95a5a6").pack(anchor="w", padx=16, pady=(14, 8))
@@ -1407,12 +1522,12 @@ class ModernMailSender(ctk.CTk):
             }
             self.save_login_user_profile(data)
             messagebox.showinfo("저장 완료", "내 프로필이 저장되었습니다.", parent=pop)
-            pop.destroy()
+            self._close_managed_window(pop, key)
 
         btn_row = ctk.CTkFrame(pop, fg_color="transparent")
         btn_row.pack(fill="x", padx=16, pady=(2, 8))
         ctk.CTkButton(btn_row, text="저장", width=120, fg_color="#28a745", command=_save).pack(side="left")
-        ctk.CTkButton(btn_row, text="닫기", width=120, command=pop.destroy).pack(side="right")
+        ctk.CTkButton(btn_row, text="닫기", width=120, command=lambda: self._close_managed_window(pop, key)).pack(side="right")
 
     def build_account_detail(self, parent, provider, idx):
         task_key = f"{provider}_{idx}"
@@ -1627,65 +1742,7 @@ class ModernMailSender(ctk.CTk):
                 count_lbl.configure(text=f"총 {n}건 등록 (1 ~ {n}행)")
 
         def load_excel():
-            paths = filedialog.askopenfilenames(filetypes=[("Excel Files", "*.xlsx *.xls *.csv")])
-            if not paths:
-                return
-
-            try:
-                import pandas as pd
-            except ImportError:
-                messagebox.showerror("패키지 없음", "pandas가 설치되어 있지 않아 엑셀 파일을 불러올 수 없습니다.\n\npip install pandas")
-                return
-
-            state = self.load_recipients_state(task_key)
-            existing_rows = list(state.get("rows", []))
-            merged_headers = list(state.get("headers", []))
-            new_rows = []
-            start = len(tree.get_children()) + 1
-            loaded_files = 0
-            failed_files = []
-
-            for path in paths:
-                try:
-                    lower = path.lower()
-                    df = pd.read_csv(path) if lower.endswith(".csv") else pd.read_excel(path)
-                except Exception as e:
-                    failed_files.append(f"{os.path.basename(path)}: {e}")
-                    continue
-
-                loaded_files += 1
-                for col in list(df.columns):
-                    if col not in merged_headers:
-                        merged_headers.append(col)
-
-                for i, (_, r) in enumerate(df.iterrows(), start=start):
-                    comp = r.get('업체명', '') if '업체명' in r else (str(r.iloc[0]) if len(r) > 0 else '')
-                    email = r.get('이메일', '') if '이메일' in r else (str(r.iloc[1]) if len(r) > 1 else '')
-                    tree.insert("", "end", values=(i, comp, email))
-
-                    row_data = {}
-                    for col in df.columns:
-                        val = r.get(col, '')
-                        row_data[col] = str(val) if val is not None and str(val).strip() else ''
-                    new_rows.append(row_data)
-                start += len(df.index)
-                del df
-                gc.collect()
-
-            if loaded_files == 0:
-                detail = "\n".join(failed_files[:5])
-                messagebox.showerror("불러오기 실패", f"선택한 파일을 읽지 못했습니다.\n{detail}")
-                return
-
-            combined_rows = existing_rows + new_rows
-            update_count_label()
-            self.save_recipients_rows(task_key, combined_rows, merged_headers)
-            if failed_files:
-                detail = "\n".join(failed_files[:5])
-                messagebox.showwarning(
-                    "일부 파일 실패",
-                    f"{loaded_files}개 파일은 추가되었고, {len(failed_files)}개 파일은 실패했습니다.\n{detail}",
-                )
+            self._on_load_excel_clicked(task_key, tree, update_count_label)
 
         def clear_excel():
             for item in tree.get_children():
@@ -2018,6 +2075,15 @@ class ModernMailSender(ctk.CTk):
             justify="left",
         )
         camp_status.pack(fill="x", padx=12, pady=(0, 2))
+        camp_account = ctk.CTkLabel(
+            hours_banner,
+            text=f"계정: {self._sidebar_label_text(task_key, self.task_key_to_index.get(task_key, 0) or 0)}",
+            font=self._font_small,
+            text_color="#dfe6e9",
+            anchor="w",
+            justify="left",
+        )
+        camp_account.pack(fill="x", padx=12, pady=(0, 2))
         camp_resume = ctk.CTkLabel(
             hours_banner,
             text="다음 자동 재개 예정: -",
@@ -2054,6 +2120,7 @@ class ModernMailSender(ctk.CTk):
         camp_fix.pack(anchor="w", padx=12, pady=(0, 8))
         self.campaign_ui[task_key] = {
             "status": camp_status,
+            "account": camp_account,
             "resume": camp_resume,
             "counts": camp_counts,
             "autostart": camp_autostart,
@@ -2064,23 +2131,15 @@ class ModernMailSender(ctk.CTk):
             if self._start_in_flight.get(task_key) or self._engine_locks.get(task_key) and self._engine_locks[task_key].locked():
                 return
             if self.campaign_store:
-                blocking = self.campaign_store.find_blocking_job(self.login_user_id)
+                blocking = self.campaign_store.find_blocking_job(self.login_user_id, task_key)
                 if blocking:
-                    bkey = blocking.get("task_key") or ""
-                    if blocking.get("status") == JOB_NEEDS_ATTENTION:
+                    job_st = blocking.get("status")
+                    if job_st == JOB_NEEDS_ATTENTION:
                         self._prompt_needs_attention(blocking)
                         return
-                    if bkey == task_key and blocking.get("status") in RESUME_JOB_STATUSES:
+                    if blocking.get("status") in RESUME_JOB_STATUSES:
                         if self._engine_locks.get(task_key) and self._engine_locks[task_key].locked():
                             return
-                    if bkey and bkey != task_key:
-                        messagebox.showwarning(
-                            "캠페인 중복",
-                            "이미 진행 중이거나 예약 대기 중인 자동발송이 있습니다.\n"
-                            "한 사용자당 활성 캠페인은 하나만 실행됩니다.",
-                            parent=t3,
-                        )
-                        return
             interval = interval_cb.get()
             prevent_dup = prevent_dup_var.get()
             apply_public_filter = public_filter_var.get()
@@ -2243,15 +2302,18 @@ class ModernMailSender(ctk.CTk):
         final_title, final_body = self._render_message_with_variables(task_key, title, body, sample_row)
         unresolved_tokens = sorted(set(re.findall(r"\{\{[^{}]+\}\}", f"{final_title}\n{final_body}")))
 
-        pop = ctk.CTkToplevel(self)
-        pop.title("메시지 미리보기")
-        pop.geometry("760x620")
-        pop.minsize(440, 400)
-        pop.attributes("-topmost", True)
-        try:
-            pop.transient(self)
-        except Exception:
-            pass
+        pop = self.dialogs.open_toplevel(
+            "message_preview",
+            title="메시지 미리보기",
+            geometry="760x620",
+            minsize=(440, 400),
+            modal=False,
+        )
+        if pop is None:
+            return
+        if getattr(pop, "_ui_dialog_built", False):
+            return
+        pop._ui_dialog_built = True
         ctk.CTkLabel(pop, text="최종 치환 미리보기", font=("맑은 고딕", 15, "bold")).pack(anchor="w", padx=12, pady=(12, 6))
         ctk.CTkLabel(
             pop,
@@ -2293,7 +2355,12 @@ class ModernMailSender(ctk.CTk):
         btn_row = ctk.CTkFrame(pop, fg_color="transparent")
         btn_row.pack(fill="x", padx=12, pady=(0, 10))
         ctk.CTkButton(btn_row, text="🌐 브라우저 렌더 보기", width=180, command=_open_html_render).pack(side="left")
-        ctk.CTkButton(btn_row, text="닫기", width=100, command=pop.destroy).pack(side="right")
+        ctk.CTkButton(
+            btn_row,
+            text="닫기",
+            width=100,
+            command=lambda: self._close_managed_window(pop, "message_preview"),
+        ).pack(side="right")
 
     def _translate_smtp_error(self, err_msg):
         """Task 3-2: SMTP 에러 코드(550, 553, 535 등)를 한국어로 보충 설명."""
@@ -2352,34 +2419,77 @@ class ModernMailSender(ctk.CTk):
 
         schedule_on_ui(self, apply)
 
+    def _campaign_recipient_rows(self, task_key):
+        """로그인 사용자 수신처를 이메일 기준 1건으로 모은다. 계정별 목록을 복제하지 않는다."""
+        seen = set()
+        out = []
+        keys = [task_key]
+        try:
+            data = self._read_recipients_state_all()
+            for k in data.keys():
+                if k and k not in keys and not str(k).startswith("__"):
+                    keys.append(k)
+        except Exception:
+            data = {}
+        for k in keys:
+            state = self.load_recipients_state(k)
+            for row in state.get("rows") or []:
+                if not isinstance(row, dict):
+                    continue
+                email = str(row.get("이메일") or row.get("email") or "").strip().lower()
+                if not email or email in seen:
+                    continue
+                seen.add(email)
+                out.append(row)
+        if out:
+            return out
+        return list(self.load_recipients_state(task_key).get("rows") or [])
+
+    def _task_keys_for_job(self, job_id):
+        keys = []
+        try:
+            for w in self.campaign_store.list_workers(job_id):
+                k = w.get("task_key") or ""
+                if k and k not in keys:
+                    keys.append(k)
+        except Exception:
+            pass
+        return keys
+
     def _refresh_campaign_ui(self, key):
         ui = self.campaign_ui.get(key)
         if not ui or not self.campaign_store:
             return
         job_id = self.campaign_job_ids.get(key)
-        stats = self.campaign_store.stats_dict(job_id) if job_id else {}
+        worker_id = self.campaign_worker_ids.get(key)
+        stats = self.campaign_store.stats_dict(job_id, worker_id=worker_id, task_key=key) if job_id else {}
         status = stats.get("status") or ""
         ko = CAMPAIGN_STATUS_KO.get(status, status or "대기")
         nxt = stats.get("next_resume_at") or ""
+        acct = self._sidebar_label_text(key, self.task_key_to_index.get(key, 0) or 0)
 
         def apply():
             try:
+                if ui.get("account"):
+                    ui["account"].configure(text=f"계정: {acct}")
                 ui["status"].configure(text=f"현재 작업 상태: {ko}")
                 if status == JOB_SCHEDULED_PAUSE:
                     try:
                         dt = datetime.fromisoformat(nxt) if nxt else self.business_hours.next_send_window_start()
                         ui["resume"].configure(text=self.business_hours.format_resume_text(dt))
                     except Exception:
-                        ui["resume"].configure(text=f"다음 자동 재개 예정: {nxt or '-'}")
+                        ui["resume"].configure(text=f"다음 발송 또는 재개: {nxt or '-'}")
                 elif status == JOB_RUNNING:
-                    ui["resume"].configure(text="다음 자동 재개 예정: 현재 발송 가능 시간")
+                    ui["resume"].configure(text="다음 발송 또는 재개: 현재 발송 가능 시간")
                 else:
-                    ui["resume"].configure(text="다음 자동 재개 예정: -")
+                    ui["resume"].configure(text="다음 발송 또는 재개: -")
+                sent = int(stats.get("success") or 0)
+                remaining = int(stats.get("remaining") or 0)
                 ui["counts"].configure(
                     text=(
-                        f"전체 {int(stats.get('total') or 0)} · 성공 {int(stats.get('success') or 0)} · "
-                        f"건너뜀 {int(stats.get('skipped') or 0)} · 실패 {int(stats.get('failed') or 0)} · "
-                        f"남은 {int(stats.get('remaining') or 0)}"
+                        f"발송 완료 {sent} · 남은 {remaining} · "
+                        f"전체 {int(stats.get('total') or 0)} · 건너뜀 {int(stats.get('skipped') or 0)} · "
+                        f"실패 {int(stats.get('failed') or 0)}"
                     )
                 )
                 auto = "활성" if is_autostart_enabled() else "비활성"
@@ -2419,7 +2529,7 @@ class ModernMailSender(ctk.CTk):
         if jid:
             job = self.campaign_store.get_job(jid)
         if not job or job.get("status") != JOB_NEEDS_ATTENTION:
-            blocking = self.campaign_store.find_blocking_job(self.login_user_id)
+            blocking = self.campaign_store.find_blocking_job(self.login_user_id, key)
             if blocking and blocking.get("status") == JOB_NEEDS_ATTENTION:
                 job = blocking
         if not job or job.get("status") != JOB_NEEDS_ATTENTION:
@@ -2457,13 +2567,34 @@ class ModernMailSender(ctk.CTk):
         self._sync_autostart_registry()
         self._refresh_campaign_ui(key)
         if status in (JOB_RUNNING, JOB_SCHEDULED_PAUSE):
-            self._set_send_buttons(key, "running" if status == JOB_RUNNING else "paused")
-            btns = self.campaign_buttons.get(key) or {}
-            threading.Thread(
-                target=self._start_campaign_runner,
-                args=(job_id, key, btns.get("start"), btns.get("stop")),
-                daemon=True,
-            ).start()
+            workers = []
+            try:
+                workers = self.campaign_store.list_resumable_workers(self.login_user_id)
+            except Exception:
+                workers = []
+            started = False
+            for w in workers:
+                if w.get("job_id") != job_id:
+                    continue
+                wk = w.get("task_key") or key
+                self.campaign_job_ids[wk] = job_id
+                self.campaign_worker_ids[wk] = w.get("worker_id")
+                self._set_send_buttons(wk, "running" if status == JOB_RUNNING else "paused")
+                btns = self.campaign_buttons.get(wk) or {}
+                threading.Thread(
+                    target=self._start_campaign_runner,
+                    args=(job_id, wk, btns.get("start"), btns.get("stop")),
+                    daemon=True,
+                ).start()
+                started = True
+            if not started:
+                self._set_send_buttons(key, "running" if status == JOB_RUNNING else "paused")
+                btns = self.campaign_buttons.get(key) or {}
+                threading.Thread(
+                    target=self._start_campaign_runner,
+                    args=(job_id, key, btns.get("start"), btns.get("stop")),
+                    daemon=True,
+                ).start()
         elif status == JOB_NEEDS_ATTENTION:
             self._set_send_buttons(key, "paused")
         else:
@@ -2474,14 +2605,18 @@ class ModernMailSender(ctk.CTk):
             return
         job_id = job["job_id"]
         key = job.get("task_key") or ""
-        win = ctk.CTkToplevel(self)
-        win.title("발송 확인 필요")
-        win.geometry("760x620")
-        win.transient(self)
-        try:
-            win.grab_set()
-        except Exception:
-            pass
+        attn_key = f"attention_{job_id}"
+        win = self.dialogs.open_toplevel(
+            attn_key,
+            title="발송 확인 필요",
+            geometry="760x620",
+            modal=True,
+        )
+        if win is None:
+            return
+        if getattr(win, "_ui_dialog_built", False):
+            return
+        win._ui_dialog_built = True
 
         reason_lbl = ctk.CTkLabel(win, text="", font=self._font_small, justify="left", anchor="w", wraplength=720)
         reason_lbl.pack(fill="x", padx=12, pady=(12, 4))
@@ -2571,7 +2706,7 @@ class ModernMailSender(ctk.CTk):
                 refresh()
                 return False
             try:
-                win.destroy()
+                self._close_managed_window(win, attn_key)
             except Exception:
                 pass
             self._start_after_attention_release(job_id, key, st)
@@ -2585,7 +2720,7 @@ class ModernMailSender(ctk.CTk):
                     return
                 confirmed = True
             elif action == ACTION_SKIP:
-                note = simpledialog.askstring("건너뛰기", "사유를 입력하세요.", parent=win) or ""
+                note = self.dialogs.askstring("건너뛰기", "사유를 입력하세요.", key="attention_skip", parent=win) or ""
                 if not note.strip():
                     messagebox.showwarning("사유 필요", "건너뛰기에는 사유가 필요합니다.", parent=win)
                     return
@@ -2607,7 +2742,7 @@ class ModernMailSender(ctk.CTk):
             finish_if_released()
 
         def on_rebind_files():
-            files = filedialog.askopenfilenames(title="첨부파일 다시 지정", parent=win)
+            files = self.dialogs.askopenfilenames(key="attention_rebind_files", title="첨부파일 다시 지정", parent=win)
             if not files:
                 return
             _, missing = replace_job_attachments(self.campaign_store, job_id, files=list(files))
@@ -2619,7 +2754,7 @@ class ModernMailSender(ctk.CTk):
             live = current_job()
             attach = self.campaign_store.job_snapshot_attachments(live)
             keys = list((attach.get("imgs") or {}).keys())
-            files = filedialog.askopenfilenames(title="CID 이미지 다시 지정", parent=win)
+            files = self.dialogs.askopenfilenames(key="attention_rebind_cids", title="CID 이미지 다시 지정", parent=win)
             if not files:
                 return
             if keys:
@@ -2639,7 +2774,7 @@ class ModernMailSender(ctk.CTk):
                 return
             cancel_campaign(self.campaign_store, job_id, now=self.business_hours.now())
             try:
-                win.destroy()
+                self._close_managed_window(win, attn_key)
             except Exception:
                 pass
             self._start_after_attention_release(job_id, key, JOB_CANCELLED)
@@ -2652,31 +2787,34 @@ class ModernMailSender(ctk.CTk):
             fg_color="#922b21",
             command=on_cancel_job,
         ).pack(side="left", padx=4)
-        ctk.CTkButton(btn_row, text="닫기", fg_color="#566573", command=win.destroy).pack(side="right", padx=4)
+        ctk.CTkButton(btn_row, text="닫기", fg_color="#566573", command=lambda: self._close_managed_window(win, attn_key)).pack(side="right", padx=4)
         refresh()
 
     def _ensure_campaign_job(self, p, i, title, body, s_name, data, interval, prevent_dup, apply_public_filter, template_name):
         key = f"{p}_{i}"
-        blocking = self.campaign_store.find_blocking_job(self.login_user_id)
-        if blocking:
-            if blocking.get("status") == JOB_NEEDS_ATTENTION:
-                if self._try_resume_after_attention(blocking):
-                    return self.campaign_store.get_job(blocking["job_id"])
-                return blocking
-            if blocking.get("task_key") == key and blocking.get("status") in RESUME_JOB_STATUSES:
-                return blocking
-            if blocking.get("task_key") != key:
-                raise DuplicateActiveCampaignError(blocking)
-        existing = self.campaign_store.find_resumable_job(self.login_user_id, key)
-        if existing:
+        worker = self.campaign_store.find_active_worker(self.login_user_id, key)
+        if worker and worker.get("status") in (JOB_RUNNING, JOB_QUEUED, JOB_SCHEDULED_PAUSE):
+            existing = self.campaign_store.get_job(worker["job_id"]) or {}
+            existing["worker_id"] = worker["worker_id"]
             return existing
+        job_level = None
+        try:
+            jobs = self.campaign_store.list_active_jobs(self.login_user_id)
+            job_level = jobs[0] if jobs else None
+        except Exception:
+            job_level = None
+        if job_level and job_level.get("status") == JOB_NEEDS_ATTENTION and not worker:
+            if self._try_resume_after_attention(job_level):
+                job = self.campaign_store.get_job(job_level["job_id"]) or job_level
+                job["worker_id"] = self.campaign_store.primary_worker_id(job_level["job_id"], key)
+                return job
+            return job_level
         try:
             with open(self.config_file, "r", encoding="utf-8") as f:
                 config = json.load(f).get(key)
         except Exception:
             config = None
-        state = self.load_recipients_state(key)
-        all_rows = state.get("rows", [])
+        all_rows = self._campaign_recipient_rows(key)
         if not config or not all_rows:
             return None
         live = resolve_smtp_for_send(self.config_file, key, config)
@@ -2706,8 +2844,14 @@ class ModernMailSender(ctk.CTk):
                 status=JOB_NEEDS_ATTENTION,
                 now=self.business_hours.now(),
             )
-            self.campaign_store.set_needs_attention(job["job_id"], format_missing_files_reason(missing))
-            return self.campaign_store.get_job(job["job_id"])
+            if not job.get("joined_existing"):
+                self.campaign_store.set_needs_attention(job["job_id"], format_missing_files_reason(missing))
+            elif job.get("worker_id"):
+                self.campaign_store.set_needs_attention_worker(job["worker_id"], format_missing_files_reason(missing))
+            live_job = self.campaign_store.get_job(job["job_id"]) or job
+            live_job["worker_id"] = job.get("worker_id")
+            live_job["joined_existing"] = job.get("joined_existing")
+            return live_job
         job = self.campaign_store.create_job(
             login_user_id=self.login_user_id,
             task_key=key,
@@ -2728,18 +2872,41 @@ class ModernMailSender(ctk.CTk):
         )
         if snapshot_contains_secrets(job.get("smtp_config_json")):
             self.campaign_store.scrub_stored_smtp_secrets()
-            job = self.campaign_store.get_job(job["job_id"])
+            refreshed = self.campaign_store.get_job(job["job_id"])
+            if refreshed:
+                refreshed["worker_id"] = job.get("worker_id")
+                refreshed["joined_existing"] = job.get("joined_existing")
+                job = refreshed
+        wid = job.get("worker_id")
         if self.business_hours.is_send_allowed():
-            self.campaign_store.set_status(job["job_id"], JOB_RUNNING, now=self.business_hours.now())
+            if wid:
+                self.campaign_store.set_worker_status(wid, JOB_RUNNING, now=self.business_hours.now())
+            if not job.get("joined_existing"):
+                self.campaign_store.set_status(job["job_id"], JOB_RUNNING, now=self.business_hours.now())
+            elif (self.campaign_store.get_job(job["job_id"]) or {}).get("status") not in RESUME_JOB_STATUSES:
+                self.campaign_store.set_status(job["job_id"], JOB_RUNNING, now=self.business_hours.now())
         else:
             nxt = self.business_hours.next_send_window_start()
-            self.campaign_store.set_status(
-                job["job_id"],
-                JOB_SCHEDULED_PAUSE,
-                next_resume_at=nxt.isoformat(timespec="seconds"),
-                now=self.business_hours.now(),
-            )
-        return self.campaign_store.get_job(job["job_id"])
+            iso = nxt.isoformat(timespec="seconds")
+            if job.get("joined_existing") and wid:
+                self.campaign_store.set_worker_status(
+                    wid, JOB_SCHEDULED_PAUSE, next_resume_at=iso, now=self.business_hours.now()
+                )
+            else:
+                self.campaign_store.set_status(
+                    job["job_id"],
+                    JOB_SCHEDULED_PAUSE,
+                    next_resume_at=iso,
+                    now=self.business_hours.now(),
+                )
+                if wid:
+                    self.campaign_store.set_worker_status(
+                        wid, JOB_SCHEDULED_PAUSE, next_resume_at=iso, now=self.business_hours.now(), sync_job=False
+                    )
+        live_job = self.campaign_store.get_job(job["job_id"]) or job
+        live_job["worker_id"] = wid
+        live_job["joined_existing"] = job.get("joined_existing")
+        return live_job
 
     def _start_campaign_runner(self, job_id, key, s_b=None, st_b=None):
         lock = self._engine_locks.setdefault(key, threading.Lock())
@@ -2757,15 +2924,19 @@ class ModernMailSender(ctk.CTk):
 
     def _run_campaign_runner_locked(self, job_id, key, s_b=None, st_b=None):
         job0 = self.campaign_store.get_job(job_id) or {}
-        p = job0.get("provider") or self._split_task_key(key)[0]
+        worker_id = self.campaign_worker_ids.get(key) or job0.get("worker_id") or self.campaign_store.primary_worker_id(job_id, key)
+        worker0 = self.campaign_store.get_worker(worker_id) if worker_id else None
+        p = (worker0 or {}).get("provider") or job0.get("provider") or self._split_task_key(key)[0]
         try:
-            i = int(job0.get("account_idx") or self._split_task_key(key)[1])
+            i = int((worker0 or {}).get("account_idx") or job0.get("account_idx") or self._split_task_key(key)[1])
         except Exception:
             i = self._split_task_key(key)[1]
         self.campaign_job_ids[key] = job_id
+        if worker_id:
+            self.campaign_worker_ids[key] = worker_id
         self._sync_autostart_registry()
         self._refresh_campaign_ui(key)
-        interval_label = job0.get("interval_label") or "5분"
+        interval_label = (worker0 or {}).get("interval_label") or job0.get("interval_label") or "5분"
 
         def prepare(job, item):
             row_data = item.get("recipient") or {}
@@ -2778,8 +2949,10 @@ class ModernMailSender(ctk.CTk):
             prevent_dup = bool(job.get("prevent_dup"))
             apply_public_filter = bool(job.get("apply_public_filter"))
             data = self.campaign_store.job_snapshot_attachments(job)
-            snapshot = self.campaign_store.job_smtp_config(job)
-            config = resolve_smtp_for_send(self.config_file, job.get("task_key") or key, snapshot)
+            live_worker = self.campaign_store.get_worker(worker_id) if worker_id else None
+            smtp_key = (live_worker or {}).get("task_key") or key
+            snapshot = self.campaign_store.worker_smtp_config(live_worker or {}) if live_worker else self.campaign_store.job_smtp_config(job)
+            config = resolve_smtp_for_send(self.config_file, smtp_key, snapshot)
             if not config:
                 return "halt", "SMTP 계정 자격증명을 찾을 수 없습니다. 계정 설정에서 비밀번호를 확인한 뒤 다시 시작하세요."
             if snapshot_contains_secrets(snapshot):
@@ -2833,7 +3006,7 @@ class ModernMailSender(ctk.CTk):
 
         def send_once(payload, job, item):
             config = payload.get("config") or resolve_smtp_for_send(
-                self.config_file, job.get("task_key") or key, self.campaign_store.job_smtp_config(job)
+                self.config_file, key, self.campaign_store.job_smtp_config(job)
             )
             if not config:
                 return False, "자격증명 없음"
@@ -2892,6 +3065,7 @@ class ModernMailSender(ctk.CTk):
             wait_poll_seconds=1,
             owner=f"{self.login_user_id}:{key}:{os.getpid()}",
             sent_lookup_fn=lambda item, job=job0: self._lookup_sent_for_campaign_item(item, job),
+            worker_id=worker_id,
         )
         result = runner.run(job_id, wait_off_hours=True)
         self._refresh_campaign_ui(key)
@@ -2900,7 +3074,9 @@ class ModernMailSender(ctk.CTk):
             self._set_send_buttons(key, "paused")
         elif result == JOB_NEEDS_ATTENTION:
             self._set_send_buttons(key, "paused")
-            schedule_on_ui(self, lambda: self._prompt_needs_attention(self.campaign_store.get_job(job_id)))
+            live = self.campaign_store.get_job(job_id) or {}
+            if (live.get("status") == JOB_NEEDS_ATTENTION) or self.campaign_store.count_by_status(job_id, "needs_review") > 0:
+                schedule_on_ui(self, lambda: self._prompt_needs_attention(self.campaign_store.get_job(job_id)))
         else:
             self._set_send_buttons(key, "idle")
             if s_b is not None and st_b is not None:
@@ -2913,37 +3089,41 @@ class ModernMailSender(ctk.CTk):
         self._recovery_started = True
         uid = self.login_user_id or ""
         try:
-            attention = self.campaign_store.list_needs_attention_jobs(uid)
-            jobs = self.campaign_store.list_resumable_jobs(uid)
+            attention = self.campaign_store.list_attention_workers(uid)
+            workers = self.campaign_store.list_resumable_workers(uid)
         except Exception:
             return
-        for job in attention:
-            if (job.get("login_user_id") or "") != uid:
+        for worker in attention:
+            if (worker.get("login_user_id") or "") != uid:
                 continue
-            key = job.get("task_key") or ""
+            key = worker.get("task_key") or ""
             p, i = self._split_task_key(key)
-            self.campaign_job_ids[key] = job["job_id"]
-            self.write_log(p, i, f"⚠ 사용자 확인이 필요합니다. {job.get('attention_reason') or ''}")
+            self.campaign_job_ids[key] = worker["job_id"]
+            self.campaign_worker_ids[key] = worker["worker_id"]
+            self.write_log(p, i, f"⚠ 사용자 확인이 필요합니다. {worker.get('attention_reason') or ''}")
             self._set_send_buttons(key, "paused")
             self._refresh_campaign_ui(key)
-            schedule_on_ui(self, lambda j=job: self._prompt_needs_attention(j))
-        for job in jobs:
-            if (job.get("login_user_id") or "") != uid:
+            job = self.campaign_store.get_job(worker["job_id"]) or worker
+            if (job.get("status") == JOB_NEEDS_ATTENTION):
+                schedule_on_ui(self, lambda j=job: self._prompt_needs_attention(j))
+        for worker in workers:
+            if (worker.get("login_user_id") or "") != uid:
                 continue
-            key = job.get("task_key") or ""
+            key = worker.get("task_key") or ""
             if not key:
                 continue
             if key in self._engine_locks and self._engine_locks[key].locked():
                 continue
             self.stop_flags[key] = False
             self.campaign_cancel_flags[key] = False
-            self.campaign_job_ids[key] = job["job_id"]
+            self.campaign_job_ids[key] = worker["job_id"]
+            self.campaign_worker_ids[key] = worker["worker_id"]
             btns = self.campaign_buttons.get(key) or {}
             p, i = self._split_task_key(key)
             self.write_log(p, i, "🔁 저장된 발송 작업을 복구합니다.")
             threading.Thread(
                 target=self._start_campaign_runner,
-                args=(job["job_id"], key, btns.get("start"), btns.get("stop")),
+                args=(worker["job_id"], key, btns.get("start"), btns.get("stop")),
                 daemon=True,
             ).start()
         self._sync_autostart_registry()
@@ -3068,6 +3248,9 @@ class ModernMailSender(ctk.CTk):
             if not job:
                 self.write_log(p, i, "❌ 계정/수신처 부족")
                 return
+            self.campaign_job_ids[key] = job["job_id"]
+            if job.get("worker_id"):
+                self.campaign_worker_ids[key] = job["worker_id"]
             if job.get("status") == JOB_NEEDS_ATTENTION:
                 self.write_log(p, i, job.get("attention_reason") or "사용자 확인이 필요합니다.")
                 self._set_send_buttons(key, "paused")
@@ -3083,12 +3266,13 @@ class ModernMailSender(ctk.CTk):
                 self._set_send_buttons(key, "paused")
             self._start_campaign_runner(job["job_id"], key, s_b, st_b)
         except DuplicateActiveCampaignError as e:
-            self.write_log(p, i, "❌ 이미 활성 캠페인이 있어 새 작업을 만들지 않았습니다.")
+            self.write_log(p, i, "❌ 이미 이 SMTP 계정으로 실행 중인 자동발송이 있습니다.")
             schedule_on_ui(
                 self,
                 lambda: messagebox.showwarning(
                     "캠페인 중복",
-                    "이미 진행 중이거나 예약 대기 중인 자동발송이 있습니다.",
+                    "이미 이 SMTP 계정으로 진행 중이거나 예약 대기 중인 자동발송이 있습니다.\n"
+                    "같은 계정은 동시에 두 번 시작할 수 없습니다.",
                     parent=self,
                 ),
             )
@@ -3134,13 +3318,22 @@ class ModernMailSender(ctk.CTk):
     def set_stop(self, k):
         self.stop_flags[k] = True
         p, i = self._split_task_key(k)
-        self.write_log(p, i, "⏹ 사용자 요청으로 정지합니다. 다음 영업일에 자동 재개되지 않습니다.")
+        self.write_log(p, i, "⏹ 사용자 요청으로 이 계정만 정지합니다. 다른 계정은 계속 발송됩니다.")
 
     def set_cancel(self, k):
         self.campaign_cancel_flags[k] = True
         self.stop_flags[k] = True
+        job_id = self.campaign_job_ids.get(k)
+        if job_id and self.campaign_store:
+            for other in self._task_keys_for_job(job_id):
+                self.campaign_cancel_flags[other] = True
+                self.stop_flags[other] = True
+            try:
+                cancel_campaign(self.campaign_store, job_id, now=self.business_hours.now())
+            except Exception:
+                pass
         p, i = self._split_task_key(k)
-        self.write_log(p, i, "🗑 작업을 취소합니다. 대기열은 더 이상 발송되지 않습니다.")
+        self.write_log(p, i, "🗑 캠페인 전체를 취소합니다. 대기열은 더 이상 발송되지 않습니다.")
     def reset_btns(self, s, st): self.after(0, lambda: (s.configure(state="normal"), st.configure(state="disabled", fg_color="#555")))
 
     def _export_to_excel(self, task_key):
@@ -3170,10 +3363,11 @@ class ModernMailSender(ctk.CTk):
             return
 
         # 엑셀 파일 저장 경로 선택
-        file_path = filedialog.asksaveasfilename(
+        file_path = self.dialogs.asksaveasfilename(
+            key="export_excel",
             defaultextension=".xlsx",
             filetypes=[("Excel Files", "*.xlsx"), ("All Files", "*.*")],
-            initialfile=f"{task_key}_발송결과_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            initialfile=f"{task_key}_발송결과_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         )
 
         if not file_path:
@@ -3190,7 +3384,16 @@ class ModernMailSender(ctk.CTk):
         if BlacklistManager is None:
             messagebox.showerror("오류", "블랙리스트 관리 모듈을 찾을 수 없습니다.")
             return
-        BlacklistManager(self, self)
+        key = "blacklist"
+        existing = self.dialogs.get_open(key)
+        if existing not in (None, True, "native") and is_widget_alive(existing):
+            self.dialogs.reveal_toplevel(existing, modal=False, key=key)
+            return
+        parent = self.dialogs.live_parent() or self
+        win = BlacklistManager(parent, self)
+        win._dialog_close_cb = lambda: self._close_managed_window(win, key)
+        self.dialogs.register_open(key, win)
+        self.dialogs.reveal_toplevel(win, modal=False, key=key)
 
     def _sync_blacklist_from_sheet(self):
         """Phase 5 Task 5-1: 구글 시트 'blacklist' 워크시트에서 읽어 로컬 blacklist 테이블 최신화.
@@ -3371,7 +3574,7 @@ class ModernMailSender(ctk.CTk):
         threading.Thread(target=_run, daemon=True).start()
 
     def _start_test_send(self, provider, idx, title, body, sender_name, data, send_btn, test_btn):
-        to_email = simpledialog.askstring("테스트 메일", "테스트 수신처 이메일:", parent=self)
+        to_email = self.dialogs.askstring("테스트 메일", "테스트 수신처 이메일:", key="test_mail")
         if not to_email:
             return
 
@@ -3430,7 +3633,7 @@ class ModernMailSender(ctk.CTk):
 
     def attach_file(self, d, refresh=None):
         """선택한 파일을 첨부 목록에 추가(기존 목록에 이어 붙임, 동일 경로는 제외)."""
-        ps = filedialog.askopenfilenames()
+        ps = self.dialogs.askopenfilenames(key="attach_files", title="첨부파일 선택")
         if not ps:
             return
         cur = list(d.get("files") or [])
@@ -3446,10 +3649,10 @@ class ModernMailSender(ctk.CTk):
             refresh()
 
     def attach_cid(self, d, refresh=None):
-        p = filedialog.askopenfilename()
+        p = self.dialogs.askopenfilename(key="attach_cid_file", title="CID 이미지 선택")
         if not p:
             return
-        c = simpledialog.askstring("CID", "CID 이름:", parent=self)
+        c = self.dialogs.askstring("CID", "CID 이름:", key="attach_cid_name")
         if not c or not str(c).strip():
             return
         c = str(c).strip()
@@ -3460,7 +3663,7 @@ class ModernMailSender(ctk.CTk):
             refresh()
 
     def save_tpl(self, t, b, s, d, task_key=None):
-        n = simpledialog.askstring("저장", "템플릿 이름:"); 
+        n = self.dialogs.askstring("저장", "템플릿 이름:", key="save_template_name")
         if n:
             try:
                 with open(self.template_file, "r", encoding="utf-8") as f:
@@ -3482,47 +3685,65 @@ class ModernMailSender(ctk.CTk):
                 self.current_template_name[task_key] = n
 
     def open_tpl_library(self, t, b, s, d, f_l, i_l, task_key_tpl, refresh_attach=None):
-        pop = ctk.CTkToplevel(self)
-        pop.title("템플릿")
-        pop.geometry("320x420")
-        pop.minsize(260, 280)
-        pop.attributes("-topmost", True)
-        try:
-            pop.transient(self)
-        except Exception:
-            pass
+        key = "template_library"
+        pop = self.dialogs.open_toplevel(
+            key,
+            title="템플릿",
+            geometry="320x420",
+            minsize=(260, 280),
+            modal=False,
+        )
+        if pop is None:
+            return
+        if getattr(pop, "_ui_dialog_built", False):
+            return
+        pop._ui_dialog_built = True
         frame = ctk.CTkScrollableFrame(pop)
         frame.pack(fill="both", expand=True, padx=5, pady=5)
-        with open(self.template_file, 'r', encoding='utf-8') as f:
-            tpls = json.load(f)
-            for name in tpls.keys():
-                row = ctk.CTkFrame(frame, fg_color="transparent"); row.pack(fill="x", pady=1)
-                def apply(n=name):
-                    with open(self.template_file, 'r', encoding='utf-8') as f:
+        try:
+            with open(self.template_file, "r", encoding="utf-8") as f:
+                tpls = json.load(f)
+        except Exception:
+            tpls = {}
+        if not isinstance(tpls, dict):
+            tpls = {}
+        for name in tpls.keys():
+            row = ctk.CTkFrame(frame, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+
+            def apply(n=name):
+                try:
+                    with open(self.template_file, "r", encoding="utf-8") as f:
                         tpl = json.load(f).get(n)
-                        if not tpl:
-                            messagebox.showerror("오류", "템플릿을 읽을 수 없습니다.", parent=pop)
-                            return
-                        t.delete(0, 'end'); t.insert(0, tpl['title'])
-                        b.delete("1.0", "end"); b.insert("1.0", tpl['body'])
-                        s.delete(0, 'end'); s.insert(0, tpl.get('sender', ''))
-                        d["files"] = []
-                        d["imgs"] = {}
-                        raw_files = tpl.get("files")
-                        raw_imgs = tpl.get("imgs")
-                        if isinstance(raw_files, list):
-                            d["files"] = [str(x) for x in raw_files]
-                        if isinstance(raw_imgs, dict):
-                            d["imgs"] = {str(k): str(v) for k, v in raw_imgs.items()}
-                        nf, ni = len(d["files"]), len(d["imgs"])
-                        f_l.configure(text=f"📎 첨부: {nf}개" if nf else "📎 첨부: 없음")
-                        i_l.configure(text=f"🖼️ CID: {ni}개" if ni else "🖼️ CID: 없음")
-                        if callable(refresh_attach):
-                            refresh_attach()
-                        self.current_template_name[task_key_tpl] = n
-                    pop.destroy()
-                ctk.CTkButton(row, text=name, command=apply).pack(side="left", expand=True, fill="x", padx=1)
-                ctk.CTkButton(row, text="X", width=25, fg_color="red", command=lambda n=name: self.del_tpl(n, pop)).pack(side="right")
+                except Exception:
+                    tpl = None
+                if not tpl:
+                    messagebox.showerror("오류", "템플릿을 읽을 수 없습니다.", parent=pop)
+                    return
+                t.delete(0, "end")
+                t.insert(0, tpl["title"])
+                b.delete("1.0", "end")
+                b.insert("1.0", tpl["body"])
+                s.delete(0, "end")
+                s.insert(0, tpl.get("sender", ""))
+                d["files"] = []
+                d["imgs"] = {}
+                raw_files = tpl.get("files")
+                raw_imgs = tpl.get("imgs")
+                if isinstance(raw_files, list):
+                    d["files"] = [str(x) for x in raw_files]
+                if isinstance(raw_imgs, dict):
+                    d["imgs"] = {str(k): str(v) for k, v in raw_imgs.items()}
+                nf, ni = len(d["files"]), len(d["imgs"])
+                f_l.configure(text=f"📎 첨부: {nf}개" if nf else "📎 첨부: 없음")
+                i_l.configure(text=f"🖼️ CID: {ni}개" if ni else "🖼️ CID: 없음")
+                if callable(refresh_attach):
+                    refresh_attach()
+                self.current_template_name[task_key_tpl] = n
+                self._close_managed_window(pop, key)
+
+            ctk.CTkButton(row, text=name, command=apply).pack(side="left", expand=True, fill="x", padx=1)
+            ctk.CTkButton(row, text="X", width=25, fg_color="red", command=lambda n=name: self.del_tpl(n, pop)).pack(side="right")
 
     def del_tpl(self, n, p):
         if messagebox.askyesno("삭제", f"'{n}' 삭제할까요?", parent=p):
@@ -3534,4 +3755,4 @@ class ModernMailSender(ctk.CTk):
             if isinstance(data, dict) and n in data:
                 del data[n]
                 self._atomic_write_json_path(self.template_file, data, indent=4, ensure_ascii=False)
-            p.destroy()
+            self._close_managed_window(p, "template_library")

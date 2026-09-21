@@ -12,6 +12,7 @@ except ImportError:
 from app_paths import bundled_file, install_dir, writable_file
 from data_migrate import format_migration_user_message, last_migration_report, prepare_user_data
 from login_network import AUTOSTART_NET_DELAYS, is_auth_error, is_transient_network_error
+from ui_dialogs import reveal_window
 from version_compare import (
     compare_versions,
     evaluate_update_prompt,
@@ -26,7 +27,7 @@ BASE_DIR = install_dir()
 CREDENTIALS_FILE = bundled_file("credentials.json")
 
 # Phase 8 Task 8-x: 구글 시트 버전과 비교할 앱 현재 버전
-CURRENT_VERSION = "v2.8.0"
+CURRENT_VERSION = "v2.8.1"
 SPREADSHEET_KEY = "1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw"
 
 # GitHub 릴리스 연동: 시트 B1이 비어 있거나 "GITHUB"이면 최신 Release의 .exe URL 사용 (구글 드라이브 불필요)
@@ -172,6 +173,7 @@ class LoginApp(ctk.CTk):
         super().__init__()
         self.on_success = on_success
         self.autostart_recovery = bool(autostart_recovery)
+        self.pending_launch = None
         self._closing = False
         self._login_cancel = False
         self._autostart_login_running = False
@@ -272,7 +274,7 @@ class LoginApp(ctk.CTk):
         pop = ctk.CTkToplevel(self)
         pop.title("필수 업데이트")
         pop.geometry("400x200")
-        pop.attributes("-topmost", True)
+        reveal_window(pop, self, modal=False, brief_topmost_ms=250)
         ctk.CTkLabel(pop, text="필수 업데이트 진행 중...", font=("맑은 고딕", 14, "bold")).pack(pady=(24, 12))
         prog = ctk.CTkProgressBar(pop, width=320, height=16)
         prog.pack(pady=12, padx=40)
@@ -525,9 +527,18 @@ Remove-Item -LiteralPath '{script_ps}' -Force
         return latest, url, sha256_hex, release_page
 
     def _launch_main_app(self, user_name, grade, rem, login_user_id=""):
-        self.withdraw()
+        """로그인 mainloop 를 종료만 한다. 메인 창은 숨겨진 LoginApp 을 destroy 한 뒤에 연다."""
+        self.pending_launch = {
+            "user_name": user_name,
+            "grade": grade,
+            "remaining": rem,
+            "login_user_id": login_user_id,
+        }
+        try:
+            self.withdraw()
+        except Exception:
+            pass
         self.quit()
-        self.on_success(user_name, grade, rem, login_user_id)
 
     def _check_update_after_login(self, user_name, grade, rem, login_user_id=""):
         """로그인 성공 직후: 원격 버전이 더 높을 때만 업데이트 안내."""
@@ -701,11 +712,7 @@ Remove-Item -LiteralPath '{script_ps}' -Force
         pop.title("회원가입 신청")
         pop.geometry("360x420")
         pop.minsize(300, 380)
-        pop.attributes("-topmost", True)
-        try:
-            pop.transient(self)
-        except Exception:
-            pass
+        reveal_window(pop, self, modal=False, brief_topmost_ms=250)
 
         ctk.CTkLabel(pop, text="회원가입 신청", font=("맑은 고딕", 16, "bold")).pack(pady=(18, 10))
         ctk.CTkLabel(pop, text="신청 후 상태는 '승인대기'로 등록됩니다.", font=("맑은 고딕", 11), text_color="#95a5a6").pack(pady=(0, 10))

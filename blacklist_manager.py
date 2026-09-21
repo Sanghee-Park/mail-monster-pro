@@ -1,5 +1,5 @@
 import customtkinter as ctk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox
 import sqlite3
 import os
 
@@ -102,6 +102,7 @@ class BlacklistManager(ctk.CTkToplevel):
 
         mid_frame.bind("<Configure>", _resize_blacklist_tree, add="+")
         self.after(150, _apply_blacklist_tree_size)
+        self._dialog_close_cb = None
 
         # 하단: 버튼(한 줄에 너무 많으면 줄바꿈 느낌으로 2행)
         bottom_frame = ctk.CTkFrame(self)
@@ -111,11 +112,21 @@ class BlacklistManager(ctk.CTkToplevel):
         ctk.CTkButton(bf1, text="선택된 항목 제거", command=self._remove_from_blacklist).pack(side="left", padx=4, pady=2)
         ctk.CTkButton(bf1, text="새로고침", command=self._refresh_table).pack(side="left", padx=4, pady=2)
         ctk.CTkButton(bf1, text="전체 제거", command=self._clear_all).pack(side="left", padx=4, pady=2)
-        ctk.CTkButton(bf1, text="닫기", command=self.destroy).pack(side="right", padx=4, pady=2)
-        
+        ctk.CTkButton(bf1, text="닫기", command=self._close_window).pack(side="right", padx=4, pady=2)
+
         # 초기 로드
         self._refresh_table()
-    
+
+    def _close_window(self):
+        cb = getattr(self, "_dialog_close_cb", None)
+        if callable(cb):
+            cb()
+            return
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
     def _add_to_blacklist(self):
         """블랙리스트에 이메일 추가"""
         email = self.email_entry.get().strip()

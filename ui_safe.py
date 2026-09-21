@@ -1,6 +1,11 @@
 """Tk/CustomTkinter 위젯은 생성한 메인 스레드에서만 갱신한다."""
 from __future__ import annotations
 
+import logging
+import traceback
+
+logger = logging.getLogger("mail_monster.ui")
+
 
 def schedule_on_ui(root, fn) -> None:
     if root is None or not callable(fn):
@@ -13,6 +18,7 @@ def schedule_on_ui(root, fn) -> None:
             return
         root.after(0, lambda: _run_ui(root, fn))
     except Exception:
+        logger.exception("schedule_on_ui after 실패")
         return
 
 
@@ -25,4 +31,9 @@ def _run_ui(root, fn) -> None:
             return
         fn()
     except Exception:
-        return
+        tb = traceback.format_exc()
+        logger.error("UI callback 예외\n%s", tb)
+        try:
+            setattr(root, "_last_ui_error", tb)
+        except Exception:
+            pass

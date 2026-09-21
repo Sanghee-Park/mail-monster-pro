@@ -402,7 +402,7 @@ class DialogCampaignStressTests(unittest.TestCase):
         self.td.cleanup()
 
     def test_campaign_workers_continue_while_dialogs_used(self):
-        rows = [{"업체명": f"c{i}", "이메일": f"a{i}@ex.com"} for i in range(1, 9)]
+        rows = [{"업체명": f"c{i}", "이메일": f"a{i}@ex.com"} for i in range(1, 13)]
         job_a = self.store.create_job(
             login_user_id="alice",
             task_key="네이버_1",
@@ -497,7 +497,7 @@ class DialogCampaignStressTests(unittest.TestCase):
         before = len(sent)
         mgr.askopenfilenames(key="excel_recipients")
         mgr.open_toplevel("template_library", title="템플릿")
-        time.sleep(0.08)
+        time.sleep(1.2)
         self.assertGreater(len(sent), before)
         t1.join(8)
         t2.join(8)

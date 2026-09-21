@@ -1,5 +1,21 @@
 # MAIL MONSTER PRO 변경 이력
 
+## [v2.8.2] - 2026-09-22
+
+### SMTP 계정별 완전 독립 캠페인
+- `campaign_jobs`와 `campaign_queue`를 `(login_user_id, task_key)`별 독립 job으로 생성한다. 다른 SMTP 계정은 수신자·대기열·lease·중지·취소·통계를 공유하지 않는다.
+- `recipients.json` 원본을 보존하면서 계정별 recipient set을 SQLite로 승계한다. 정규화 이메일 UNIQUE로 같은 파일 재등록과 대소문자·공백 중복을 제거한다.
+- v2.8.1 공용 sender-pool에서 원래 계정을 복원할 수 없는 pending queue는 임의 분배하지 않고 `needs_attention / needs_review`로 차단한다.
+
+### 중복·블랙리스트 안전성
+- SMTP 직전 `(login_user_id, normalized_email, final_content_hash)` SQLite reservation을 `BEGIN IMMEDIATE`로 획득하여 다른 SMTP 계정과 동시 runner에서도 한 번만 SMTP에 도달한다.
+- SMTP 접수 여부가 불명확한 연결 오류는 `needs_review`로 두고 자동 재발송하지 않는다. 성공은 안정적인 Message-ID와 `sent_log`/reservation에 기록한다.
+- blacklist를 queue 생성 시점과 SMTP 연결 직전에 모두 검사한다. 차단 항목은 `skipped / blacklist`로 기록하며 SMTP를 호출하지 않는다.
+
+### 계정별 UI 상태
+- 버튼을 선택 계정의 `(login_user_id, task_key, job_id, generation)`으로 렌더링한다. 다른 계정 event와 이전 job의 지연 callback은 현재 화면을 바꾸지 못한다.
+- `user_stopped`는 `발송 재개`, `cancelled/completed`는 새 시작, `needs_attention`은 해결 버튼 상태로 즉시 전환한다.
+
 ## [v2.8.1] - 2026-09-21
 
 ### 다중 SMTP 계정 동시 자동발송

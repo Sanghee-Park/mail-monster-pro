@@ -307,7 +307,13 @@ class CampaignRunner:
             return None
 
         if kind == "skipped":
-            self.store.mark_item(item["id"], ITEM_SKIPPED, error_message=str(payload or ""))
+            skip_reason = str(payload or "")
+            self.store.mark_item(
+                item["id"],
+                ITEM_SKIPPED,
+                error_message=skip_reason,
+                skip_reason=skip_reason,
+            )
             self._bump("skipped")
             self.store.refresh_counts(job_id)
             self._progress(job_id)
@@ -327,6 +333,51 @@ class CampaignRunner:
                 payload["msg"]["Message-ID"] = item["message_id"]
             except Exception:
                 pass
+
+        # queue 생성 후 새로 추가된 blacklist도 실제 SMTP 연결 직전에 다시 차단한다.
+        send_email = (
+            (payload or {}).get("email")
+            if isinstance(payload, dict)
+            else item.get("email")
+        ) or item.get("email")
+        if self.store.is_blacklisted(send_email):
+            self.store.mark_item(
+                item["id"],
+                ITEM_SKIPPED,
+                error_message="blacklist",
+                skip_reason="blacklist",
+                now=self.now(),
+            )
+            self._bump("skipped")
+            self.store.refresh_counts(job_id)
+            self._progress(job_id)
+            return None
+
+        reservation_id = ""
+        if bool(job.get("prevent_dup")) and isinstance(payload, dict):
+            reservation = self.store.reserve_send(
+                login_user_id=job.get("login_user_id") or "",
+                email=send_email or "",
+                content_hash=payload.get("body_hash") or payload.get("content_hash") or "",
+                job_id=job_id,
+                item_id=int(item["id"]),
+                task_key=job.get("task_key") or "",
+                message_id=item.get("message_id") or "",
+                now=self.now(),
+            )
+            if not reservation.get("acquired"):
+                self.store.mark_item(
+                    item["id"],
+                    ITEM_SKIPPED,
+                    error_message="duplicate",
+                    skip_reason="duplicate",
+                    now=self.now(),
+                )
+                self._bump("skipped")
+                self.store.refresh_counts(job_id)
+                self._progress(job_id)
+                return None
+            reservation_id = reservation.get("reservation_id") or ""
 
         attempts_done = int(item.get("attempts") or 0)
         last_err = ""
@@ -350,6 +401,25 @@ class CampaignRunner:
             if reason == "already_processed":
                 return None
 
+            if self.store.is_blacklisted(send_email):
+                self.store.mark_item(
+                    item["id"],
+                    ITEM_SKIPPED,
+                    error_message="blacklist",
+                    skip_reason="blacklist",
+                    now=self.now(),
+                )
+                self.store.set_reservation_status(
+                    reservation_id,
+                    "released",
+                    error_message="blacklist",
+                    now=self.now(),
+                )
+                self._bump("skipped")
+                self.store.refresh_counts(job_id)
+                self._progress(job_id)
+                return None
+
             self.smtp_calls += 1
             ok, err = self.send_once_fn(payload, job, live)
             attempts_done += 1
@@ -363,6 +433,7 @@ class CampaignRunner:
             )
             if ok:
                 self.store.mark_item(item["id"], ITEM_SENT, now=self.now(), message_id=item.get("message_id"))
+                self.store.set_reservation_status(reservation_id, "sent", now=self.now())
                 self._bump("sent")
                 self.store.refresh_counts(job_id)
                 self._progress(job_id)
@@ -371,6 +442,12 @@ class CampaignRunner:
             low = last_err.lower()
             if "535" in last_err or "authentication" in low or "자격증명" in last_err:
                 self.store.mark_item(item["id"], ITEM_PENDING, error_message=last_err)
+                self.store.set_reservation_status(
+                    reservation_id,
+                    "released",
+                    error_message=last_err,
+                    now=self.now(),
+                )
                 return self._halt_worker(
                     job_id,
                     "SMTP 자격증명을 확인할 수 없어 발송을 중단했습니다. 계정 설정에서 비밀번호를 확인하세요.",
@@ -386,7 +463,43 @@ class CampaignRunner:
                         return self._apply_terminal_user(job_id, reason)
                     self.sleep_fn(1)
 
+        low = (last_err or "").lower()
+        ambiguous = any(
+            token in low
+            for token in (
+                "timeout",
+                "timed out",
+                "connection reset",
+                "server disconnected",
+                "broken pipe",
+                "connection aborted",
+                "remote end closed",
+            )
+        )
+        if ambiguous:
+            self.store.mark_item(
+                item["id"],
+                ITEM_NEEDS_REVIEW,
+                error_message="SMTP 접수 여부가 불명확하여 자동 재발송하지 않습니다.",
+                now=self.now(),
+            )
+            self.store.set_reservation_status(
+                reservation_id,
+                "review",
+                error_message=last_err,
+                now=self.now(),
+            )
+            return self._halt_worker(
+                job_id,
+                "SMTP 접수 여부가 불명확한 항목이 있어 자동 재발송하지 않습니다.",
+            )
         self.store.mark_item(item["id"], ITEM_FAILED, error_message=last_err, now=self.now())
+        self.store.set_reservation_status(
+            reservation_id,
+            "failed",
+            error_message=last_err,
+            now=self.now(),
+        )
         self._bump("failed")
         self.store.refresh_counts(job_id)
         self._progress(job_id)

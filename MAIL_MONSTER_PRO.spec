@@ -40,6 +40,7 @@ hiddenimports = [
     'business_hours',
     'campaign_store',
     'campaign_runtime',
+    'campaign_ui_state',
     'app_paths',
     'version_compare',
     'smtp_credentials',

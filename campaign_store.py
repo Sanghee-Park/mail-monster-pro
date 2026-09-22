@@ -301,6 +301,17 @@ def ensure_campaign_schema(con: sqlite3.Connection) -> None:
     )
     con.execute(
         """
+        CREATE TABLE IF NOT EXISTS account_template_prefs (
+            login_user_id TEXT NOT NULL,
+            task_key TEXT NOT NULL,
+            template_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (login_user_id, task_key)
+        )
+        """
+    )
+    con.execute(
+        """
         CREATE TABLE IF NOT EXISTS recipient_state_migrations (
             login_user_id TEXT PRIMARY KEY,
             migrated_at TEXT NOT NULL
@@ -685,6 +696,163 @@ class CampaignStore:
                     for data in (_json_loads(r["recipient_json"], {}) for r in rows)
                     if isinstance(data, dict)
                 ]
+            finally:
+                con.close()
+
+    def count_account_recipients(self, login_user_id: str, task_key: str) -> int:
+        with self._lock:
+            con = self._connect()
+            try:
+                row = con.execute(
+                    """
+                    SELECT COUNT(*) FROM account_recipients
+                    WHERE login_user_id=? AND task_key=?
+                    """,
+                    (login_user_id or "", task_key or ""),
+                ).fetchone()
+                return int(row[0] if row else 0)
+            finally:
+                con.close()
+
+    def list_account_recipients_page(
+        self,
+        login_user_id: str,
+        task_key: str,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> List[dict]:
+        """화면 페이지 조회. limit는 표시 단위이며 저장 상한이 아니다."""
+        safe_limit = max(1, int(limit or 1))
+        safe_offset = max(0, int(offset or 0))
+        with self._lock:
+            con = self._connect()
+            try:
+                rows = con.execute(
+                    """
+                    SELECT recipient_json FROM account_recipients
+                    WHERE login_user_id=? AND task_key=?
+                    ORDER BY id
+                    LIMIT ? OFFSET ?
+                    """,
+                    (login_user_id or "", task_key or "", safe_limit, safe_offset),
+                ).fetchall()
+                return [
+                    data
+                    for data in (_json_loads(r["recipient_json"], {}) for r in rows)
+                    if isinstance(data, dict)
+                ]
+            finally:
+                con.close()
+
+    def recipient_counts_by_task(self, login_user_id: str) -> Dict[str, int]:
+        with self._lock:
+            con = self._connect()
+            try:
+                rows = con.execute(
+                    """
+                    SELECT task_key, COUNT(*) AS n FROM account_recipients
+                    WHERE login_user_id=?
+                    GROUP BY task_key
+                    """,
+                    (login_user_id or "",),
+                ).fetchall()
+                return {str(r["task_key"]): int(r["n"]) for r in rows}
+            finally:
+                con.close()
+
+    def delete_account_recipients(self, login_user_id: str, task_key: str, emails: Iterable[str]) -> int:
+        norms = []
+        seen = set()
+        for raw in emails or []:
+            email = normalize_email(raw)
+            if email and email not in seen:
+                seen.add(email)
+                norms.append(email)
+        if not norms:
+            return 0
+        deleted = 0
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                for start in range(0, len(norms), 400):
+                    chunk = norms[start:start + 400]
+                    marks = ",".join("?" * len(chunk))
+                    cur = con.execute(
+                        f"""
+                        DELETE FROM account_recipients
+                        WHERE login_user_id=? AND task_key=? AND normalized_email IN ({marks})
+                        """,
+                        (login_user_id or "", task_key or "", *chunk),
+                    )
+                    deleted += int(cur.rowcount or 0)
+                con.commit()
+            finally:
+                con.close()
+        return deleted
+
+    def get_last_template_id(self, login_user_id: str, task_key: str) -> str:
+        with self._lock:
+            con = self._connect()
+            try:
+                row = con.execute(
+                    """
+                    SELECT template_id FROM account_template_prefs
+                    WHERE login_user_id=? AND task_key=?
+                    """,
+                    (login_user_id or "", task_key or ""),
+                ).fetchone()
+                return str(row["template_id"] or "") if row else ""
+            finally:
+                con.close()
+
+    def set_last_template_id(self, login_user_id: str, task_key: str, template_id: str) -> None:
+        template_id = str(template_id or "").strip()
+        if not template_id:
+            self.clear_last_template_id(login_user_id, task_key)
+            return
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute(
+                    """
+                    INSERT INTO account_template_prefs(login_user_id, task_key, template_id, updated_at)
+                    VALUES (?,?,?,?)
+                    ON CONFLICT(login_user_id, task_key) DO UPDATE SET
+                        template_id=excluded.template_id,
+                        updated_at=excluded.updated_at
+                    """,
+                    (login_user_id or "", task_key or "", template_id, _now_iso()),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+    def clear_last_template_id(self, login_user_id: str, task_key: str) -> None:
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute(
+                    "DELETE FROM account_template_prefs WHERE login_user_id=? AND task_key=?",
+                    (login_user_id or "", task_key or ""),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+    def clear_template_preferences(self, template_id: str) -> int:
+        template_id = str(template_id or "").strip()
+        if not template_id:
+            return 0
+        with self._lock:
+            con = self._connect()
+            try:
+                cur = con.execute(
+                    "DELETE FROM account_template_prefs WHERE template_id=?",
+                    (template_id,),
+                )
+                con.commit()
+                return int(cur.rowcount or 0)
             finally:
                 con.close()
 

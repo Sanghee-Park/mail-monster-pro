@@ -1,6 +1,7 @@
 import customtkinter as ctk
 from tkinter import ttk, messagebox, Menu
 import gc, hashlib, json, os, sys, random, sqlite3, re, base64
+from collections import deque
 import smtplib, threading, time, mimetypes
 import tempfile, webbrowser
 from datetime import datetime
@@ -60,6 +61,7 @@ from smtp_credentials import public_smtp_snapshot, resolve_smtp_for_send, snapsh
 from ui_safe import schedule_on_ui
 from ui_dialogs import UiDialogManager, live_ui_parent, is_usable_parent, is_widget_alive
 from recipient_import import parse_recipient_excel_files, start_excel_import
+from template_prefs import ensure_template_ids, find_template_by_id, template_id_for_name
 
 # 블랙리스트 관리 모듈 (Task 5-1)
 try:
@@ -87,7 +89,9 @@ STATE_FILES = resolve_state_files()
 
 
 # Phase 4: 계정별 로그 박스 무한 누적 방지 (발송 로직과 무관)
-LOG_CONSOLE_MAX_LINES = 1000
+LOG_CONSOLE_MAX_LINES = 300
+UI_RECIPIENT_PAGE_SIZE = 100
+ACCOUNT_PROVIDERS = ["네이버", "다음", "지메일", "네이트", "외부메일"]
 
 # Phase 6 (v2.6.8): 공공기관/단체 필터 — 이메일 도메인 또는 업체명 키워드 일치 시 발송 스킵(옵션)
 _SMART_FILTER_DOMAIN_SUFFIXES = (".go.kr", ".or.kr", ".re.kr", ".ac.kr", ".mil.kr")
@@ -388,7 +392,7 @@ class ModernMailSender(ctk.CTk):
     def _write_recipients_state_all(self, data):
         self._atomic_write_json_path(self.recipients_file, data, indent=2, ensure_ascii=False)
 
-    def load_recipients_state(self, task_key):
+    def load_recipients_state(self, task_key, *, include_rows=False):
         data = self._read_recipients_state_all()
         state = data.get(task_key) or {}
         # 호환: 과거에 rows만 바로 저장된 경우 대비
@@ -399,8 +403,11 @@ class ModernMailSender(ctk.CTk):
         state.setdefault("rows", [])
         state.setdefault("last_sent", {})
         state.setdefault("headers", [])
-        if self.campaign_store and self.campaign_store.recipient_state_migrated(self.login_user_id):
+        if include_rows and self.campaign_store and self.campaign_store.recipient_state_migrated(self.login_user_id):
             state["rows"] = self.campaign_store.list_account_recipients(self.login_user_id, task_key)
+        elif self.campaign_store and self.campaign_store.recipient_state_migrated(self.login_user_id):
+            state["rows"] = []
+            state["row_count"] = self.campaign_store.count_account_recipients(self.login_user_id, task_key)
         return state
 
     def save_recipients_rows(self, task_key, rows, headers=None):
@@ -422,9 +429,17 @@ class ModernMailSender(ctk.CTk):
                 task_key,
                 canonical_rows,
             )
-            canonical_rows = self.campaign_store.list_account_recipients(self.login_user_id, task_key)
+            state["rows"] = []
+            state["row_count"] = int((result or {}).get("total") or 0)
+        else:
             state["rows"] = canonical_rows
         data[task_key] = state
+        if self.campaign_store and self.campaign_store.recipient_state_migrated(self.login_user_id):
+            for key, value in list(data.items()):
+                if isinstance(value, dict) and value.get("rows"):
+                    copied = dict(value)
+                    copied["rows"] = []
+                    data[key] = copied
         self._write_recipients_state_all(data)
         return result or {"total": len(canonical_rows)}
 
@@ -464,21 +479,28 @@ class ModernMailSender(ctk.CTk):
             parsed = parse_recipient_excel_files(paths)
             parsed["start_no"] = start_no
             if parsed.get("loaded_files"):
-                state = self.load_recipients_state(task_key)
+                state = self.load_recipients_state(task_key, include_rows=True)
                 existing_rows = list(state.get("rows", []))
                 merged_headers = list(state.get("headers", []))
                 for col in parsed.get("headers") or []:
                     if col not in merged_headers:
                         merged_headers.append(col)
-                combined = existing_rows + list(parsed.get("rows") or [])
+                source_rows = list(parsed.get("rows") or [])
+                combined = existing_rows + source_rows
                 saved = self.save_recipients_rows(task_key, combined, merged_headers)
+                parsed["source_count"] = len(source_rows)
                 parsed["combined_count"] = int((saved or {}).get("total") or 0)
+                parsed["duplicate_count"] = int((saved or {}).get("duplicates") or 0)
+                parsed["invalid_count"] = int((saved or {}).get("invalid") or 0)
+                parsed["blacklist_count"] = self._count_blacklisted_rows(combined)
             return parsed
+
+        generation = int(getattr(self, "_bind_generation", 0) or 0)
 
         def apply_on_ui(result):
             schedule_on_ui(
                 self,
-                lambda r=result: self._apply_excel_import_result(task_key, tree, update_count_label, r),
+                lambda r=result, key=task_key, gen=generation: self._apply_excel_import_result(key, gen, r),
             )
 
         return start_excel_import(
@@ -490,12 +512,41 @@ class ModernMailSender(ctk.CTk):
             filetypes=[("Excel Files", "*.xlsx *.xls *.csv")],
         )
 
-    def _apply_excel_import_result(self, task_key, tree, update_count_label, result):
+    def _count_blacklisted_rows(self, rows):
+        tokens = []
+        con = sqlite3.connect(self.db_path)
+        try:
+            tokens = [_norm_str(r[0]) for r in con.execute("SELECT email FROM blacklist").fetchall()]
+        except Exception:
+            tokens = []
+        finally:
+            con.close()
+        tokens = [token for token in tokens if token]
+        if not tokens:
+            return 0
+        matched = 0
+        seen = set()
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            email = _norm_str(row.get("이메일") or row.get("email"))
+            if not email or email in seen:
+                continue
+            seen.add(email)
+            if any(_match_blacklist_token(email, token) for token in tokens):
+                matched += 1
+        return matched
+
+    def _apply_excel_import_result(self, task_key, generation, result):
         result = result or {}
+        current = self._live_task_key() == task_key and int(getattr(self, "_bind_generation", 0) or 0) == int(generation or 0)
         if result.get("error"):
-            self._show_dialog_error("엑셀 파일을 처리하는 중 오류가 발생했습니다.", result.get("error"))
+            if current:
+                self._show_dialog_error("엑셀 파일을 처리하는 중 오류가 발생했습니다.", result.get("error"))
             return
         if not result.get("loaded_files"):
+            if not current:
+                return
             detail = "\n".join((result.get("failed_files") or [])[:5])
             parent = live_ui_parent(self)
             messagebox.showerror(
@@ -504,27 +555,18 @@ class ModernMailSender(ctk.CTk):
                 parent=parent if is_usable_parent(parent) else None,
             )
             return
-        try:
-            if tree is None or not is_widget_alive(tree):
-                if callable(update_count_label):
-                    update_count_label()
-                return
-            for child in tree.get_children():
-                tree.delete(child)
-            canonical_rows = self.load_recipients_state(task_key).get("rows") or []
-            for i, row in enumerate(canonical_rows, start=1):
-                if not isinstance(row, dict):
-                    continue
-                comp = row.get("업체명") or row.get("comp") or ""
-                email = row.get("이메일") or row.get("email") or ""
-                tree.insert("", "end", values=(i, comp, email))
-            if callable(update_count_label):
-                update_count_label()
-        except Exception:
-            self._show_dialog_error("수신처 목록을 화면에 반영하지 못했습니다.")
-            return
+        self._import_summaries[task_key] = {
+            "source_count": int(result.get("source_count") or 0),
+            "stored_total": int(result.get("combined_count") or 0),
+            "duplicate_count": int(result.get("duplicate_count") or 0),
+            "invalid_count": int(result.get("invalid_count") or 0),
+            "blacklist_count": int(result.get("blacklist_count") or 0),
+        }
+        if current:
+            self._recipient_page = 0
+            self._render_recipient_page()
         failed_files = result.get("failed_files") or []
-        if failed_files:
+        if current and failed_files:
             detail = "\n".join(failed_files[:5])
             parent = live_ui_parent(self)
             messagebox.showwarning(
@@ -1036,7 +1078,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.8.2"
+            _ver = "v2.8.3"
 
         title_lbl = ctk.CTkLabel(
             header,
@@ -1136,27 +1178,37 @@ class ModernMailSender(ctk.CTk):
         self.profile_frames = {}
         self.sidebar_buttons = {}
         self.task_key_to_index = {}
-        max_acc = 10 if self.grade != "무료권" else 1
-        providers = ["네이버", "다음", "지메일", "네이트", "외부메일"]
-        all_slots = [(p, i) for p in providers for i in range(1, max_acc + 1)]
-        self._all_task_keys_ordered = [f"{p}_{i}" for p, i in all_slots]
+        self._account_providers = list(ACCOUNT_PROVIDERS)
+        self._detail_ctx = {"task_key": "", "provider": self._account_providers[0], "idx": 1}
+        self._compose_drafts = {}
+        self._log_buffers = {}
+        self._button_modes = {}
+        self._bind_generation = 0
+        self._recipient_page = 0
+        self._unconfigured_visible = []
+        self._import_summaries = {}
+        self._shared_widgets = {}
+        self._refresh_scheduled = False
 
         main_content = ctk.CTkFrame(body, fg_color="transparent")
         main_content.pack(side="left", fill="both", expand=True)
         self.main_content_frame = main_content
-
-        # 모든 슬롯에 대해 content frame 생성 (계정 추가 시 빈 슬롯 표시용)
-        for provider, idx in all_slots:
-            task_key = f"{provider}_{idx}"
-            content_frame = ctk.CTkFrame(main_content, fg_color="transparent")
-            self.profile_frames[task_key] = content_frame
-            self.build_account_detail(content_frame, provider, idx)
-
-        self._rebuild_sidebar_buttons()
+        content_frame = ctk.CTkFrame(main_content, fg_color="transparent")
+        content_frame.pack(fill="both", expand=True)
+        self.profile_frames["__detail__"] = content_frame
         first_key = self._get_first_display_key()
-        self.current_profile = first_key
-        if first_key and first_key in self.profile_frames:
-            self.profile_frames[first_key].pack(fill="both", expand=True)
+        if first_key:
+            provider, idx = self._split_task_key(first_key)
+            self._detail_ctx = {"task_key": first_key, "provider": provider, "idx": idx}
+        self.build_account_detail(
+            content_frame,
+            self._detail_ctx["provider"],
+            self._detail_ctx["idx"],
+        )
+        self._rebuild_sidebar_buttons()
+        self.current_profile = first_key or ""
+        if first_key:
+            self._bind_account_view(first_key)
         self._highlight_active_sidebar()
 
     def _read_full_config(self):
@@ -1191,19 +1243,18 @@ class ModernMailSender(ctk.CTk):
         self._atomic_write_json_path(self.config_file, data, indent=4, ensure_ascii=False)
 
     def _configured_task_key_set(self, config):
-        ordered = getattr(self, "_all_task_keys_ordered", [])
+        providers = set(getattr(self, "_account_providers", ACCOUNT_PROVIDERS))
         out = set()
-        for tk in ordered:
-            ent = config.get(tk)
-            if isinstance(ent, dict) and str(ent.get("id") or "").strip():
-                out.add(tk)
+        for task_key, ent in (config or {}).items():
+            if not task_key or str(task_key).startswith("__") or not isinstance(ent, dict):
+                continue
+            provider, _idx = self._split_task_key(task_key)
+            if provider in providers and str(ent.get("id") or "").strip():
+                out.add(task_key)
         return out
 
     def _get_configured_task_keys(self):
         """config.json에 id가 있는 task_key만 반환. __account_order__가 있으면 그 순서를 우선."""
-        ordered = getattr(self, "_all_task_keys_ordered", [])
-        if not ordered:
-            return []
         config = self._read_full_config()
         configured_set = self._configured_task_key_set(config)
         custom = config.get(CONFIG_META_ACCOUNT_ORDER_KEY)
@@ -1213,11 +1264,33 @@ class ModernMailSender(ctk.CTk):
                 if tk in configured_set and tk not in seen:
                     result.append(tk)
                     seen.add(tk)
-        for tk in ordered:
-            if tk in configured_set and tk not in seen:
-                result.append(tk)
-                seen.add(tk)
+        rest = sorted(configured_set - seen, key=self._account_sort_key)
+        result.extend(rest)
         return result
+
+    def _account_sort_key(self, task_key):
+        provider, idx = self._split_task_key(task_key)
+        providers = list(getattr(self, "_account_providers", ACCOUNT_PROVIDERS))
+        try:
+            order = providers.index(provider)
+        except ValueError:
+            order = len(providers)
+        return (order, int(idx or 0), task_key)
+
+    def _sidebar_task_keys(self):
+        keys = self._get_configured_task_keys()
+        seen = set(keys)
+        for task_key in list(getattr(self, "_unconfigured_visible", []) or []):
+            if task_key and task_key not in seen:
+                keys.append(task_key)
+                seen.add(task_key)
+        return keys
+
+    def _ellipsis(self, text, limit=28):
+        value = str(text or "")
+        if len(value) <= limit:
+            return value
+        return value[: max(1, limit - 1)] + "…"
 
     def _sidebar_label_text(self, task_key, index_n):
         cfg = self._read_full_config()
@@ -1229,9 +1302,9 @@ class ModernMailSender(ctk.CTk):
         else:
             login_id = ""
         if dname:
-            return dname
+            return self._ellipsis(dname, 28)
         if login_id:
-            return f"계정 {index_n} ({login_id})"
+            return self._ellipsis(f"계정 {index_n} ({login_id})", 28)
         return f"계정 {index_n}"
 
     def _safe_destroy_tk_menu(self, menu):
@@ -1383,19 +1456,24 @@ class ModernMailSender(ctk.CTk):
             del rdata[task_key]
             self._write_recipients_state_all(rdata)
         self._clear_account_ui_data(task_key)
+        self._unconfigured_visible = [key for key in self._unconfigured_visible if key != task_key]
+        self._compose_drafts.pop(task_key, None)
+        self._log_buffers.pop(task_key, None)
+        if self.campaign_store:
+            try:
+                self.campaign_store.replace_account_recipients(self.login_user_id, task_key, [])
+                self.campaign_store.clear_last_template_id(self.login_user_id, task_key)
+            except Exception:
+                pass
         was_current = getattr(self, "current_profile", None) == task_key
         self._rebuild_sidebar_buttons()
-        new_keys = self._get_configured_task_keys()
+        new_keys = self._sidebar_task_keys()
         cur = getattr(self, "current_profile", None)
         if was_current or (cur and cur not in new_keys):
             if new_keys:
                 self._switch_profile(new_keys[0])
             else:
-                empty = self._get_first_empty_task_key()
-                if empty:
-                    self._switch_profile(empty)
-                else:
-                    self._highlight_active_sidebar()
+                self._highlight_active_sidebar()
         else:
             self._highlight_active_sidebar()
 
@@ -1403,38 +1481,52 @@ class ModernMailSender(ctk.CTk):
         cur = getattr(self, "current_profile", None)
         active_font = getattr(self, "_font_sidebar_active", ("맑은 고딕", 11, "bold"))
         base_font = getattr(self, "_font_small", ("맑은 고딕", 11))
-        for tk, btn in getattr(self, "sidebar_buttons", {}).items():
-            try:
-                if tk == cur:
-                    btn.configure(fg_color="#1f538d", font=active_font, text_color="#ffffff")
-                else:
-                    btn.configure(fg_color="transparent", font=base_font, text_color=("gray10", "gray90"))
-            except Exception:
-                pass
-        for tk, g in getattr(self, "sidebar_gear_buttons", {}).items():
-            try:
-                if tk == cur:
-                    g.configure(fg_color="#2c5a8c")
-                else:
-                    g.configure(fg_color="#333333")
-            except Exception:
-                pass
+        previous = getattr(self, "_highlighted_task", None)
+        targets = [key for key in (previous, cur) if key]
+        buttons = getattr(self, "sidebar_buttons", {})
+        gears = getattr(self, "sidebar_gear_buttons", {})
+        for tk in targets:
+            btn = buttons.get(tk)
+            if btn is not None:
+                try:
+                    if tk == cur:
+                        btn.configure(fg_color="#1f538d", font=active_font, text_color="#ffffff")
+                    else:
+                        btn.configure(fg_color="transparent", font=base_font, text_color=("gray10", "gray90"))
+                except Exception:
+                    pass
+            gear = gears.get(tk)
+            if gear is not None:
+                try:
+                    gear.configure(fg_color="#2c5a8c" if tk == cur else "#333333")
+                except Exception:
+                    pass
+        self._highlighted_task = cur
 
-    def _get_first_empty_task_key(self):
-        """설정되지 않은 첫 번째 슬롯의 task_key"""
-        ordered = getattr(self, "_all_task_keys_ordered", [])
-        configured = set(self._get_configured_task_keys())
-        for tk in ordered:
-            if tk not in configured:
-                return tk
-        return None
+    def _next_provider_index(self, provider):
+        used = set()
+        config = self._read_full_config()
+        for task_key in list(config.keys()) + list(getattr(self, "_unconfigured_visible", []) or []):
+            current, idx = self._split_task_key(task_key)
+            if current == provider:
+                used.add(int(idx or 0))
+        nxt = 1
+        while nxt in used:
+            nxt += 1
+        return nxt
+
+    def _create_account_slot(self, provider):
+        provider = provider if provider in self._account_providers else self._account_providers[0]
+        task_key = f"{provider}_{self._next_provider_index(provider)}"
+        if task_key not in self._unconfigured_visible and task_key not in self._get_configured_task_keys():
+            self._unconfigured_visible.append(task_key)
+        self._rebuild_sidebar_buttons()
+        self._switch_profile(task_key)
 
     def _get_first_display_key(self):
         """처음 표시할 키: 설정된 계정이 있으면 첫 번째, 없으면 첫 빈 슬롯"""
-        configured = self._get_configured_task_keys()
-        if configured:
-            return configured[0]
-        return self._get_first_empty_task_key()
+        configured = self._sidebar_task_keys()
+        return configured[0] if configured else ""
 
     def _rebuild_sidebar_buttons(self):
         """사이드바 버튼을 설정된 계정만 1부터 스택으로 다시 그림"""
@@ -1443,13 +1535,19 @@ class ModernMailSender(ctk.CTk):
             return
         for w in scrollable.winfo_children():
             w.destroy()
-        configured = self._get_configured_task_keys()
+        configured = self._sidebar_task_keys()
+        counts = {}
+        if self.campaign_store:
+            try:
+                counts = self.campaign_store.recipient_counts_by_task(self.login_user_id)
+            except Exception:
+                counts = {}
         self.task_key_to_index.clear()
         self.sidebar_buttons.clear()
         self.sidebar_gear_buttons = {}
         for n, task_key in enumerate(configured, 1):
             self.task_key_to_index[task_key] = n
-            label = self._sidebar_label_text(task_key, n)
+            label = self._ellipsis(f"{self._sidebar_label_text(task_key, n)} · {int(counts.get(task_key) or 0)}", 32)
             row = ctk.CTkFrame(scrollable, fg_color="transparent")
             row.pack(fill="x", pady=2)
             btn = ctk.CTkButton(
@@ -1485,12 +1583,29 @@ class ModernMailSender(ctk.CTk):
         self._highlight_active_sidebar()
 
     def _on_add_account_click(self):
-        """계정 추가: 첫 번째 빈 슬롯으로 전환"""
-        first_empty = self._get_first_empty_task_key()
-        if first_empty:
-            self._switch_profile(first_empty)
-        else:
-            messagebox.showinfo("안내", "모든 슬롯이 사용 중입니다.")
+        """계정 추가: 공급자를 고르면 다음 번호의 독립 task_key를 만든다."""
+        try:
+            tk_host = self.winfo_toplevel()
+        except Exception:
+            tk_host = self
+        menu = Menu(tk_host, tearoff=0)
+        for provider in self._account_providers:
+            menu.add_command(label=provider, command=lambda p=provider: self._create_account_slot(p))
+        try:
+            widget = getattr(self, "sidebar_add_btn", None)
+            if widget is not None:
+                widget.update_idletasks()
+                x = widget.winfo_rootx()
+                y = widget.winfo_rooty() + max(widget.winfo_height(), 28)
+            else:
+                x, y = 40, 40
+            menu.tk_popup(int(x), int(y))
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+        self.after(300, lambda m=menu: self._safe_destroy_tk_menu(m))
 
     def _toggle_sidebar(self):
         """사이드바 접기/펼치기 (확장형)"""
@@ -1512,13 +1627,271 @@ class ModernMailSender(ctk.CTk):
         self.sidebar_buttons[task_key].configure(text=label)
 
     def _switch_profile(self, task_key):
-        """사이드바에서 선택한 프로필(계정)의 화면을 메인 영역에 표시"""
-        if self.current_profile and self.current_profile != task_key:
-            self.profile_frames[self.current_profile].pack_forget()
-        self.profile_frames[task_key].pack(fill="both", expand=True)
+        """같은 상세 화면에 선택 계정 데이터만 다시 바인딩한다."""
+        if not task_key:
+            return
+        current = self._live_task_key()
+        if current and current != task_key:
+            self._save_compose_draft(current)
+        self._bind_account_view(task_key)
+
+    def _live_task_key(self):
+        return str((getattr(self, "_detail_ctx", None) or {}).get("task_key") or "")
+
+    def _save_compose_draft(self, task_key):
+        widgets = getattr(self, "_shared_widgets", None) or {}
+        title = widgets.get("title")
+        body = widgets.get("body")
+        sender = widgets.get("sender")
+        if title is None or body is None or sender is None:
+            return
+        data = widgets.get("data") or {}
+        self._compose_drafts[task_key] = {
+            "title": title.get(),
+            "body": body.get("1.0", "end-1c"),
+            "sender": sender.get(),
+            "files": list(data.get("files") or []),
+            "imgs": dict(data.get("imgs") or {}),
+            "interval": widgets["interval"].get() if widgets.get("interval") is not None else "5분",
+            "prevent_dup": bool(widgets["prevent_dup"].get()) if widgets.get("prevent_dup") is not None else True,
+            "public_filter": bool(widgets["public_filter"].get()) if widgets.get("public_filter") is not None else False,
+        }
+
+    def _bind_account_view(self, task_key, restoring=True):
+        provider, idx = self._split_task_key(task_key)
+        self._detail_ctx = {"task_key": task_key, "provider": provider, "idx": idx}
+        self._bind_generation = int(getattr(self, "_bind_generation", 0) or 0) + 1
         self.current_profile = task_key
+        self._recipient_page = 0
+        widgets = self._shared_widgets or {}
+        if widgets:
+            self.tree_views = {task_key: widgets["tree"]}
+            self.log_consoles = {task_key: widgets["log"]}
+            self.campaign_buttons = {task_key: widgets["buttons"]}
+            self.campaign_ui = {task_key: widgets["campaign_ui"]}
+            self.progress_labels = {task_key: widgets["progress"]}
+            self._smtp_account_entries = {task_key: widgets["smtp"]}
+        self._load_smtp_fields(task_key)
+        if getattr(self, "_provider_label", None) is not None:
+            try:
+                self._provider_label.configure(text=f"선택 계정: {task_key}")
+            except Exception:
+                pass
+        self._restore_compose(task_key, restoring=restoring)
+        self._render_log(task_key)
+        self._render_recipient_page()
         self._highlight_active_sidebar()
         self._refresh_campaign_ui(task_key)
+        mode = self._button_modes.get(task_key, "")
+        self._set_send_buttons(task_key, mode)
+
+    def _load_smtp_fields(self, task_key):
+        widgets = (self._shared_widgets or {}).get("smtp") or {}
+        config = self._read_full_config().get(task_key)
+        config = config if isinstance(config, dict) else {}
+        values = {
+            "e_id": config.get("id") or "",
+            "e_pw": config.get("pw") or "",
+            "e_smtp": config.get("smtp") or "",
+            "e_port": str(config.get("port") or ""),
+            "e_from": config.get("sender_email") or "",
+        }
+        for name, value in values.items():
+            entry = widgets.get(name)
+            if entry is None:
+                continue
+            try:
+                entry.delete(0, "end")
+                if value:
+                    entry.insert(0, str(value))
+            except Exception:
+                pass
+        auth = widgets.get("auth_type_var")
+        if auth is not None:
+            try:
+                auth.set(config.get("auth_type") or "standard")
+            except Exception:
+                pass
+
+    def _restore_compose(self, task_key, restoring=True):
+        widgets = self._shared_widgets or {}
+        draft = self._compose_drafts.get(task_key)
+        title = widgets.get("title")
+        body = widgets.get("body")
+        sender = widgets.get("sender")
+        data = widgets.get("data")
+        if title is None or body is None or sender is None or data is None:
+            return
+        if draft:
+            self._fill_compose(draft)
+            return
+        if restoring and self._apply_saved_template(task_key):
+            return
+        self._fill_compose({"title": "", "body": "", "sender": "", "files": [], "imgs": {}, "interval": "5분", "prevent_dup": True, "public_filter": False})
+
+    def _fill_compose(self, draft):
+        widgets = self._shared_widgets or {}
+        title = widgets.get("title")
+        body = widgets.get("body")
+        sender = widgets.get("sender")
+        data = widgets.get("data")
+        try:
+            title.delete(0, "end")
+            if draft.get("title"):
+                title.insert(0, draft.get("title") or "")
+            body.delete("1.0", "end")
+            if draft.get("body"):
+                body.insert("1.0", draft.get("body") or "")
+            sender.delete(0, "end")
+            if draft.get("sender"):
+                sender.insert(0, draft.get("sender") or "")
+        except Exception:
+            pass
+        data["files"] = list(draft.get("files") or [])
+        data["imgs"] = dict(draft.get("imgs") or {})
+        if widgets.get("interval") is not None:
+            try:
+                widgets["interval"].set(draft.get("interval") or "5분")
+            except Exception:
+                pass
+        if widgets.get("prevent_dup") is not None:
+            widgets["prevent_dup"].set(bool(draft.get("prevent_dup", True)))
+        if widgets.get("public_filter") is not None:
+            widgets["public_filter"].set(bool(draft.get("public_filter", False)))
+        refresh = widgets.get("refresh_attach")
+        if callable(refresh):
+            refresh()
+
+    def _load_templates(self):
+        try:
+            with open(self.template_file, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data, changed = ensure_template_ids(data)
+        if changed:
+            self._atomic_write_json_path(self.template_file, data, indent=4, ensure_ascii=False)
+        return data
+
+    def _remember_template(self, task_key, template_name):
+        templates = self._load_templates()
+        template_id = template_id_for_name(templates, template_name)
+        self.current_template_name[task_key] = template_name or ""
+        if self.campaign_store and template_id:
+            self.campaign_store.set_last_template_id(self.login_user_id, task_key, template_id)
+        elif self.campaign_store:
+            self.campaign_store.clear_last_template_id(self.login_user_id, task_key)
+
+    def _apply_saved_template(self, task_key):
+        if not self.campaign_store:
+            return False
+        template_id = self.campaign_store.get_last_template_id(self.login_user_id, task_key)
+        if not template_id:
+            return False
+        name, item = find_template_by_id(self._load_templates(), template_id)
+        if not item:
+            self.campaign_store.clear_last_template_id(self.login_user_id, task_key)
+            self.current_template_name.pop(task_key, None)
+            return False
+        self.current_template_name[task_key] = name
+        self._fill_compose({
+            "title": item.get("title") or "",
+            "body": item.get("body") or "",
+            "sender": item.get("sender") or "",
+            "files": list(item.get("files") or []),
+            "imgs": dict(item.get("imgs") or {}),
+            "interval": "5분",
+            "prevent_dup": True,
+            "public_filter": False,
+        })
+        return True
+
+    def _render_recipient_page(self):
+        widgets = self._shared_widgets or {}
+        tree = widgets.get("tree")
+        count_lbl = widgets.get("count")
+        import_lbl = widgets.get("import")
+        page_lbl = widgets.get("page")
+        if tree is None:
+            return
+        task_key = self._live_task_key()
+        total = 0
+        if self.campaign_store and task_key:
+            total = self.campaign_store.count_account_recipients(self.login_user_id, task_key)
+        page_size = UI_RECIPIENT_PAGE_SIZE
+        pages = max(1, (total + page_size - 1) // page_size) if total else 1
+        self._recipient_page = min(max(0, int(self._recipient_page or 0)), pages - 1)
+        offset = self._recipient_page * page_size
+        rows = []
+        if self.campaign_store and task_key and total:
+            rows = self.campaign_store.list_account_recipients_page(
+                self.login_user_id, task_key, offset, page_size
+            )
+        try:
+            children = tree.get_children()
+            if children:
+                tree.delete(*children)
+            for index, row in enumerate(rows, start=offset + 1):
+                tree.insert("", "end", values=(index, row.get("업체명") or row.get("comp") or "", row.get("이메일") or row.get("email") or ""))
+        except Exception:
+            return
+        if count_lbl is not None:
+            count_lbl.configure(text="등록된 수신처 없음" if total == 0 else f"전체 {total}건")
+        if page_lbl is not None:
+            page_lbl.configure(text=f"{self._recipient_page + 1} / {pages}")
+        summary = (self._import_summaries or {}).get(task_key) or {}
+        if import_lbl is not None:
+            if not summary:
+                import_lbl.configure(text="")
+            else:
+                waiting = max(0, int(summary.get("stored_total") or total) - int(summary.get("blacklist_count") or 0))
+                import_lbl.configure(
+                    text=(
+                        f"원본 {int(summary.get('source_count') or 0)} · 유효 {total} · "
+                        f"중복 제외 {int(summary.get('duplicate_count') or 0)} · "
+                        f"형식 오류 {int(summary.get('invalid_count') or 0)} · "
+                        f"블랙리스트 {int(summary.get('blacklist_count') or 0)} · 발송 대기 {waiting}"
+                    )
+                )
+
+    def _recipient_prev_page(self):
+        self._recipient_page = max(0, int(self._recipient_page or 0) - 1)
+        self._render_recipient_page()
+
+    def _recipient_next_page(self):
+        self._recipient_page = int(self._recipient_page or 0) + 1
+        self._render_recipient_page()
+
+    def _render_log(self, task_key):
+        box = (self._shared_widgets or {}).get("log")
+        if box is None:
+            return
+        lines = list((self._log_buffers or {}).get(task_key) or [])
+        try:
+            box.configure(state="normal")
+            box.delete("1.0", "end")
+            if lines:
+                box.insert("end", "\n".join(lines) + "\n")
+            box.see("end")
+            box.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _start_test_for_current(self, title_e, body_t, sender_e, cur_d, send_b, test_b):
+        task_key = self._live_task_key()
+        provider, idx = self._split_task_key(task_key)
+        self._start_test_send(
+            provider,
+            idx,
+            title_e.get(),
+            body_t.get("1.0", "end-1c"),
+            sender_e.get(),
+            {"files": list(cur_d.get("files") or []), "imgs": dict(cur_d.get("imgs") or {})},
+            send_b,
+            test_b,
+        )
 
     def _open_user_profile_popup(self):
         """로그인 사용자 단일 프로필 편집 팝업."""
@@ -1579,6 +1952,9 @@ class ModernMailSender(ctk.CTk):
         setup_box.pack(fill="x", expand=True)
         _e = {"height": 38, "font": self._font_body}
         ctk.CTkLabel(setup_box, text="SMTP 계정", font=self._font_title).pack(anchor="w", pady=(0, 4))
+        provider_lbl = ctk.CTkLabel(setup_box, text="", font=self._font_small, text_color="#95a5a6")
+        provider_lbl.pack(anchor="w", pady=(0, 6))
+        self._provider_label = provider_lbl
 
         # Phase 9 (v2.7.3): 인증 방식 선택 — 일반 SMTP(구버전) / 분리형 인증(Amazon SES 등)
         auth_type_var = ctk.StringVar(value="standard")
@@ -1687,6 +2063,8 @@ class ModernMailSender(ctk.CTk):
         }
 
         def verify():
+            task_key = self._live_task_key()
+            provider, idx = self._split_task_key(task_key)
             uid, upw, usmtp, uport = e_id.get().strip(), e_pw.get().strip(), e_smtp.get().strip(), e_port.get().strip()
             auth_type = auth_type_var.get().strip().lower()
             if auth_type not in ("standard", "separated"):
@@ -1731,6 +2109,7 @@ class ModernMailSender(ctk.CTk):
                             entry["display_name"] = dn
                     data[task_key] = entry
                     self._atomic_write_config(data)
+                    self._unconfigured_visible = [key for key in self._unconfigured_visible if key != task_key]
                     self.write_log(provider, idx, "✅ 계정 연동 성공")
                     self.after(0, self._rebuild_sidebar_buttons)
                 except Exception as e:
@@ -1764,7 +2143,17 @@ class ModernMailSender(ctk.CTk):
         self._bind_recipients_tree_autosize(tree_wrap, tree)
 
         count_lbl = ctk.CTkLabel(list_f, text="등록된 수신처 없음", font=self._font_small, text_color="#bdc3c7")
-        count_lbl.pack(anchor="w", pady=(0, 6))
+        count_lbl.pack(anchor="w", pady=(0, 2))
+        import_lbl = ctk.CTkLabel(list_f, text="", font=("맑은 고딕", 10), text_color="#95a5a6", anchor="w", justify="left")
+        import_lbl.pack(anchor="w", pady=(0, 4))
+        page_row = ctk.CTkFrame(list_f, fg_color="transparent")
+        page_row.pack(fill="x", pady=(0, 4))
+        page_prev = ctk.CTkButton(page_row, text="이전", width=70, command=self._recipient_prev_page)
+        page_prev.pack(side="left", padx=(0, 4))
+        page_label = ctk.CTkLabel(page_row, text="1 / 1", font=self._font_small)
+        page_label.pack(side="left", padx=4)
+        page_next = ctk.CTkButton(page_row, text="다음", width=70, command=self._recipient_next_page)
+        page_next.pack(side="left", padx=4)
 
         def refresh_row_numbers():
             for i, iid in enumerate(tree.get_children(), 1):
@@ -1779,43 +2168,29 @@ class ModernMailSender(ctk.CTk):
                 count_lbl.configure(text=f"총 {n}건 등록 (1 ~ {n}행)")
 
         def load_excel():
-            self._on_load_excel_clicked(task_key, tree, update_count_label)
+            self._on_load_excel_clicked(self._live_task_key(), tree, self._render_recipient_page)
 
         def clear_excel():
-            for item in tree.get_children():
-                tree.delete(item)
-            update_count_label()
+            task_key = self._live_task_key()
             self.save_recipients_rows(task_key, [], [])
+            self._import_summaries.pop(task_key, None)
+            self._recipient_page = 0
+            self._render_recipient_page()
 
         def delete_selected():
+            task_key = self._live_task_key()
             sel = tree.selection()
             if not sel:
                 messagebox.showinfo("안내", "삭제할 행을 선택해 주세요.", parent=t2)
                 return
-            # Task 2-1: 트리 행 순서와 recipients.json의 rows[] 인덱스가 1:1이므로, 삭제 시 동일 인덱스를 pop
-            state = self.load_recipients_state(task_key)
-            rows = list(state.get("rows", []))
-            headers = state.get("headers", [])
-            children = list(tree.get_children())
-            sel_set = set(sel)
-            indices_to_remove = [i for i, iid in enumerate(children) if iid in sel_set]
-            for idx in sorted(indices_to_remove, reverse=True):
-                if 0 <= idx < len(rows):
-                    rows.pop(idx)
+            emails = []
             for iid in sel:
-                tree.delete(iid)
-            refresh_row_numbers()
-            update_count_label()
-            # 인덱스 불일치 시(과거 데이터 등): 트리 표시 순서로 rows 재구성
-            tree_ids = list(tree.get_children())
-            if len(rows) != len(tree_ids):
-                rows = []
-                for iid in tree_ids:
-                    v = tree.item(iid)["values"]
-                    comp = v[1] if len(v) > 1 else ""
-                    email = v[2] if len(v) > 2 else ""
-                    rows.append({"업체명": comp, "이메일": email})
-            self.save_recipients_rows(task_key, rows, headers)
+                values = tree.item(iid).get("values") or []
+                if len(values) > 2:
+                    emails.append(values[2])
+            if self.campaign_store:
+                self.campaign_store.delete_account_recipients(self.login_user_id, task_key, emails)
+            self._render_recipient_page()
 
         btn_row = ctk.CTkFrame(list_f, fg_color="transparent")
         btn_row.pack(fill="x", pady=4)
@@ -1838,7 +2213,7 @@ class ModernMailSender(ctk.CTk):
             export_btn_row,
             text="📊 발송 결과 엑셀로 저장",
             fg_color="#9b59b6",
-            command=lambda: self._export_to_excel(task_key),
+            command=lambda: self._export_to_excel(self._live_task_key()),
             font=self._font_small,
         ).pack(side="left", padx=4)
         ctk.CTkButton(
@@ -1848,23 +2223,6 @@ class ModernMailSender(ctk.CTk):
             command=self._open_blacklist_manager,
             font=self._font_small,
         ).pack(side="left", padx=4)
-
-        # 재실행 후에도 수신처 자동 복원
-        state = self.load_recipients_state(task_key)
-        rows = state.get("rows", [])
-        if isinstance(rows, list) and rows:
-            start = len(tree.get_children()) + 1
-            for i, r in enumerate(rows, start=start):
-                if isinstance(r, dict):
-                    comp = r.get("업체명") or r.get("comp", "")
-                    email = r.get("이메일") or r.get("email", "")
-                    tree.insert("", "end", values=(i, comp, email))
-                else:
-                    try:
-                        tree.insert("", "end", values=(i, r[0], r[1]))
-                    except Exception:
-                        pass
-            update_count_label()
 
         # 메시지 탭 전체 스크롤: 첨부/CID·배너 등으로 하단 버튼이 밀리지 않도록
         t3_scroll = ctk.CTkScrollableFrame(t3, fg_color="transparent")
@@ -1962,7 +2320,7 @@ class ModernMailSender(ctk.CTk):
             height=32,
             font=self._font_small,
             command=lambda: self.open_tpl_library(
-                title_e, body_t, sender_e, cur_d, f_lbl, i_lbl, task_key, refresh_attach_ui
+                title_e, body_t, sender_e, cur_d, f_lbl, i_lbl, self._live_task_key(), refresh_attach_ui
             ),
         ).grid(row=0, column=0, padx=2, pady=2, sticky="w")
         ctk.CTkButton(
@@ -1982,7 +2340,7 @@ class ModernMailSender(ctk.CTk):
             fg_color="#7f8c8d",
             font=self._font_small,
             command=lambda: self._open_message_preview(
-                task_key,
+                self._live_task_key(),
                 title_e.get(),
                 body_t.get("1.0", "end-1c"),
                 tree,
@@ -1995,7 +2353,7 @@ class ModernMailSender(ctk.CTk):
             width=78,
             height=32,
             font=self._font_small,
-            command=lambda: self.save_tpl(title_e, body_t, sender_e, cur_d, task_key),
+            command=lambda: self.save_tpl(title_e, body_t, sender_e, cur_d, self._live_task_key()),
         ).grid(row=0, column=3, padx=2, pady=2, sticky="w")
         ctk.CTkButton(
             toolbar,
@@ -2152,7 +2510,7 @@ class ModernMailSender(ctk.CTk):
             hours_banner,
             text="확인 필요 해결",
             width=160,
-            command=lambda k=task_key: self._open_attention_for_key(k),
+            command=lambda: self._open_attention_for_key(self._live_task_key()),
         )
         camp_fix.pack(anchor="w", padx=12, pady=(0, 8))
         camp_fix.pack_forget()
@@ -2166,6 +2524,8 @@ class ModernMailSender(ctk.CTk):
         }
 
         def start():
+            task_key = self._live_task_key()
+            provider, idx = self._split_task_key(task_key)
             if self._start_in_flight.get(task_key) or self._engine_locks.get(task_key) and self._engine_locks[task_key].locked():
                 return
             if self.campaign_store:
@@ -2222,7 +2582,7 @@ class ModernMailSender(ctk.CTk):
                     title_e.get(),
                     body_t.get("1.0", "end-1c"),
                     sender_name,
-                    cur_d,
+                    {"files": list(cur_d.get("files") or []), "imgs": dict(cur_d.get("imgs") or {})},
                     interval,
                     prevent_dup,
                     apply_public_filter,
@@ -2239,9 +2599,16 @@ class ModernMailSender(ctk.CTk):
         btn_f.pack(fill="x", pady=8)
         send_b = ctk.CTkButton(btn_f, text="🚀 자동발송 시작", height=42, font=self._font_small, command=start)
         send_b.pack(side="left", fill="x", expand=True, padx=4)
-        test_b = ctk.CTkButton(btn_f, text="🧪 테스트 발송", height=42, fg_color="#3498db", font=self._font_small, command=lambda: self._start_test_send(provider, idx, title_e.get(), body_t.get("1.0", "end-1c"), sender_e.get(), cur_d, send_b, test_b))
+        test_b = ctk.CTkButton(
+            btn_f,
+            text="🧪 테스트 발송",
+            height=42,
+            fg_color="#3498db",
+            font=self._font_small,
+            command=lambda: self._start_test_for_current(title_e, body_t, sender_e, cur_d, send_b, test_b),
+        )
         test_b.pack(side="left", fill="x", expand=True, padx=4)
-        stop_b = ctk.CTkButton(btn_f, text="🛑 중지", height=42, state="disabled", font=self._font_small, command=lambda: self.set_stop(task_key))
+        stop_b = ctk.CTkButton(btn_f, text="🛑 중지", height=42, state="disabled", font=self._font_small, command=lambda: self.set_stop(self._live_task_key()))
         stop_b.pack(side="right", fill="x", expand=True, padx=4)
         cancel_b = ctk.CTkButton(
             btn_f,
@@ -2251,7 +2618,7 @@ class ModernMailSender(ctk.CTk):
             state="disabled",
             fg_color="#7f8c8d",
             font=self._font_small,
-            command=lambda: self.set_cancel(task_key),
+            command=lambda: self.set_cancel(self._live_task_key()),
         )
         cancel_b.pack(side="right", padx=4)
         self.campaign_buttons[task_key] = {"start": send_b, "stop": stop_b, "cancel": cancel_b, "test": test_b}
@@ -2263,18 +2630,25 @@ class ModernMailSender(ctk.CTk):
         progress_lbl = ctk.CTkLabel(send_f, text="마지막 성공 전송: 없음", font=self._font_small, text_color="#bdc3c7")
         progress_lbl.pack(anchor="w", pady=(2, 0))
         self.progress_labels[task_key] = progress_lbl
-
-        # 재실행 후 마지막 성공 전송 정보 복원
-        try:
-            last_sent = self.load_recipients_state(task_key).get("last_sent", {}) or {}
-            if last_sent:
-                no = last_sent.get("no", "?")
-                comp = last_sent.get("comp", "")
-                email = last_sent.get("email", "")
-                at = last_sent.get("at", "")
-                progress_lbl.configure(text=f"마지막 성공 전송: {no}행  {comp} <{email}>  ({at})")
-        except Exception:
-            pass
+        self._shared_widgets = {
+            "tree": tree,
+            "count": count_lbl,
+            "import": import_lbl,
+            "page": page_label,
+            "log": log_t,
+            "buttons": self.campaign_buttons[task_key],
+            "campaign_ui": self.campaign_ui[task_key],
+            "progress": progress_lbl,
+            "smtp": self._smtp_account_entries[task_key],
+            "title": title_e,
+            "body": body_t,
+            "sender": sender_e,
+            "data": cur_d,
+            "interval": interval_cb,
+            "prevent_dup": prevent_dup_var,
+            "public_filter": public_filter_var,
+            "refresh_attach": refresh_attach_ui,
+        }
 
         # (start/버튼은 위에서 이미 배치됨)
 
@@ -2311,8 +2685,11 @@ class ModernMailSender(ctk.CTk):
 
     def _open_message_preview(self, task_key, title, body, tree_widget=None):
         """메시지 발송 전 최종 치환 결과를 확인하는 미리보기 창."""
-        state = self.load_recipients_state(task_key)
-        rows = state.get("rows", [])
+        rows = []
+        if self.campaign_store:
+            rows = self.campaign_store.list_account_recipients_page(self.login_user_id, task_key, 0, 1)
+        else:
+            rows = self.load_recipients_state(task_key, include_rows=True).get("rows", [])
         sample_row = {}
         if isinstance(rows, list) and rows:
             # 수신처 탭에서 선택한 행이 있으면 그 행을 샘플로 사용
@@ -2445,7 +2822,12 @@ class ModernMailSender(ctk.CTk):
         )
 
     def _set_send_buttons(self, key, status, *, job_id=None, generation=None):
-        btns = self.campaign_buttons.get(key) or {}
+        if job_id is not None and not self._campaign_event_is_current(key, job_id, generation):
+            return
+        self._button_modes[key] = status
+        if key != self._live_task_key():
+            return
+        btns = (self._shared_widgets or {}).get("buttons") or self.campaign_buttons.get(key) or {}
         start_b, stop_b, cancel_b = btns.get("start"), btns.get("stop"), btns.get("cancel")
         aliases = {
             "running": JOB_RUNNING,
@@ -2483,8 +2865,12 @@ class ModernMailSender(ctk.CTk):
         """선택 SMTP 계정에 귀속된 수신처만 정규화 이메일 기준으로 반환한다."""
         seen = set()
         out = []
-        state = self.load_recipients_state(task_key)
-        for row in state.get("rows") or []:
+        rows = []
+        if self.campaign_store:
+            rows = self.campaign_store.list_account_recipients(self.login_user_id, task_key)
+        else:
+            rows = self.load_recipients_state(task_key, include_rows=True).get("rows") or []
+        for row in rows:
             if not isinstance(row, dict):
                 continue
             email = str(row.get("이메일") or row.get("email") or "").strip().lower()
@@ -2524,6 +2910,8 @@ class ModernMailSender(ctk.CTk):
     def _refresh_campaign_ui(self, key, *, job_id=None, generation=None):
         ui = self.campaign_ui.get(key)
         if not ui or not self.campaign_store:
+            return
+        if key != self._live_task_key():
             return
         if job_id is not None and not self._campaign_event_is_current(key, job_id, generation):
             return
@@ -3437,24 +3825,15 @@ class ModernMailSender(ctk.CTk):
             )
 
     def write_log(self, p, i, m):
+        key = f"{p}_{i}"
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
+        bucket = self._log_buffers.setdefault(key, deque(maxlen=LOG_CONSOLE_MAX_LINES))
+        bucket.append(line)
+
         def _apply():
-            key = f"{p}_{i}"
-            box = self.log_consoles.get(key)
-            if box is None:
+            if key != self._live_task_key():
                 return
-            try:
-                box.configure(state="normal")
-                box.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {m}\n")
-                while True:
-                    end_idx = box.index("end-1c")
-                    line_no = int(float(end_idx.split(".")[0]))
-                    if line_no <= LOG_CONSOLE_MAX_LINES:
-                        break
-                    box.delete("1.0", "2.0")
-                box.see("end")
-                box.configure(state="disabled")
-            except Exception:
-                return
+            self._render_log(key)
 
         schedule_on_ui(self, _apply)
 
@@ -3848,10 +4227,11 @@ class ModernMailSender(ctk.CTk):
                 "files": list(d.get("files") or []),
                 "imgs": dict(d.get("imgs") or {}),
             }
+            data, _changed = ensure_template_ids(data)
             self._atomic_write_json_path(self.template_file, data, indent=4, ensure_ascii=False)
             messagebox.showinfo("완료", f"'{n}' 저장 성공")
             if task_key:
-                self.current_template_name[task_key] = n
+                self._remember_template(task_key, n)
 
     def open_tpl_library(self, t, b, s, d, f_l, i_l, task_key_tpl, refresh_attach=None):
         key = "template_library"
@@ -3869,13 +4249,7 @@ class ModernMailSender(ctk.CTk):
         pop._ui_dialog_built = True
         frame = ctk.CTkScrollableFrame(pop)
         frame.pack(fill="both", expand=True, padx=5, pady=5)
-        try:
-            with open(self.template_file, "r", encoding="utf-8") as f:
-                tpls = json.load(f)
-        except Exception:
-            tpls = {}
-        if not isinstance(tpls, dict):
-            tpls = {}
+        tpls = self._load_templates()
         for name in tpls.keys():
             row = ctk.CTkFrame(frame, fg_color="transparent")
             row.pack(fill="x", pady=1)
@@ -3908,7 +4282,7 @@ class ModernMailSender(ctk.CTk):
                 i_l.configure(text=f"🖼️ CID: {ni}개" if ni else "🖼️ CID: 없음")
                 if callable(refresh_attach):
                     refresh_attach()
-                self.current_template_name[task_key_tpl] = n
+                self._remember_template(task_key_tpl, n)
                 self._close_managed_window(pop, key)
 
             ctk.CTkButton(row, text=name, command=apply).pack(side="left", expand=True, fill="x", padx=1)
@@ -3922,6 +4296,9 @@ class ModernMailSender(ctk.CTk):
             except Exception:
                 data = {}
             if isinstance(data, dict) and n in data:
+                removed = data.get(n) if isinstance(data.get(n), dict) else {}
                 del data[n]
                 self._atomic_write_json_path(self.template_file, data, indent=4, ensure_ascii=False)
+                if self.campaign_store and removed.get("id"):
+                    self.campaign_store.clear_template_preferences(removed.get("id"))
             self._close_managed_window(p, "template_library")

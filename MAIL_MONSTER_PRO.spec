@@ -41,6 +41,7 @@ hiddenimports = [
     'campaign_store',
     'campaign_runtime',
     'campaign_ui_state',
+    'template_prefs',
     'app_paths',
     'version_compare',
     'smtp_credentials',

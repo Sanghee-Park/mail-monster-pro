@@ -541,6 +541,16 @@ class CampaignStore:
                 last = exc
                 if attempt == 0 and self._retry_after_readonly(exc):
                     continue
+                if "unable to open" in str(exc).lower():
+                    parent = os.path.dirname(self.db_path) or "."
+                    names = []
+                    try:
+                        names = os.listdir(parent)[:8]
+                    except OSError:
+                        names = ["listdir-failed"]
+                    raise sqlite3.OperationalError(
+                        f"{exc}; exists={os.path.isfile(self.db_path)}; dir={os.path.isdir(parent)}; names={names}"
+                    ) from exc
                 self._raise_storage_error(exc, folder)
                 raise
             con.row_factory = sqlite3.Row

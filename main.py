@@ -69,9 +69,106 @@ def run_ui_self_test() -> int:
         return 0
 
 
+def run_storage_self_test() -> int:
+    """임시 데이터 폴더에서 JSON·SQLite 저장만 확인한다. SMTP·시트·HKCU는 호출하지 않는다."""
+    import os
+    import sqlite3
+    from pathlib import Path
+
+    from app_paths import DATA_DIR_ENV
+    from campaign_store import CampaignStore
+    from data_migrate import chosen_data_dir, prepare_user_data, reset_prepare_cache
+    from json_atomic import atomic_write_json, read_json_object
+
+    phase = "write"
+    if "--storage-self-test-verify" in sys.argv:
+        phase = "verify"
+    elif "--storage-self-test-fallback" in sys.argv:
+        phase = "fallback"
+
+    if phase == "fallback":
+        if os.environ.get("MAILMONSTER_SELFTEST") != "1":
+            return 9
+        local = os.environ.get("LOCALAPPDATA") or ""
+        if not local:
+            return 8
+        os.environ.pop(DATA_DIR_ENV, None)
+        reset_prepare_cache()
+        prepare_user_data(force=True)
+        chosen = chosen_data_dir()
+        if not os.path.normcase(os.path.abspath(chosen)).startswith(os.path.normcase(os.path.abspath(local))):
+            return 2
+        target = Path(chosen)
+        atomic_write_json(
+            str(target / "recipients.json"),
+            {"네이버_1": {"row_count": 1}, "메일플러그_1": {"row_count": 2}},
+            kind="수신처 목록",
+        )
+        db_path = str(target / "sent_history.db")
+        store = CampaignStore(db_path)
+        del store
+        con = sqlite3.connect(db_path)
+        con.execute("CREATE TABLE IF NOT EXISTS selftest_probe(note TEXT)")
+        con.execute("INSERT INTO selftest_probe(note) VALUES ('kept')")
+        con.commit()
+        con.close()
+        again = CampaignStore(db_path)
+        del again
+        con = sqlite3.connect(db_path)
+        row = con.execute("SELECT note FROM selftest_probe").fetchone()
+        con.close()
+        if not row or row[0] != "kept":
+            return 7
+        return 0
+
+    data = os.environ.get(DATA_DIR_ENV) or ""
+    if not data:
+        return 3
+    root = Path(data)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "recipients.json"
+    db_path = root / "sent_history.db"
+    if phase == "write":
+        atomic_write_json(
+            str(path),
+            {
+                "네이버_1": {"rows": [], "row_count": 1},
+                "메일플러그_1": {"rows": [], "row_count": 2},
+            },
+            kind="수신처 목록",
+        )
+        store = CampaignStore(str(db_path))
+        del store
+        con = sqlite3.connect(str(db_path))
+        con.execute("CREATE TABLE IF NOT EXISTS selftest_probe(note TEXT)")
+        con.execute("INSERT INTO selftest_probe(note) VALUES ('kept')")
+        con.commit()
+        con.close()
+        return 0
+    payload = read_json_object(str(path))
+    if payload.get("네이버_1", {}).get("row_count") != 1:
+        return 4
+    if payload.get("메일플러그_1", {}).get("row_count") != 2:
+        return 5
+    if not db_path.is_file():
+        return 6
+    con = sqlite3.connect(str(db_path))
+    try:
+        row = con.execute("SELECT note FROM selftest_probe").fetchone()
+    except sqlite3.Error:
+        return 6
+    finally:
+        con.close()
+    if not row or row[0] != "kept":
+        return 6
+    return 0
+
+
 if __name__ == "__main__":
     if "--ui-self-test" in sys.argv:
         sys.exit(run_ui_self_test())
+    if any(arg.startswith("--storage-self-test") for arg in sys.argv):
+        sys.exit(run_storage_self_test())
     prepare_user_data()
     if not acquire_single_instance():
         show_already_running_message(silent=AUTOSTART_RECOVERY)

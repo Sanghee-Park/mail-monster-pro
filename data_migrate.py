@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -18,6 +20,7 @@ from app_paths import (
     _dir_is_writable,
     install_dir,
 )
+from json_atomic import clear_readonly, file_allows_write
 
 MIGRATABLE_FILES: Tuple[str, ...] = (
     "sent_history.db",
@@ -53,12 +56,14 @@ class MigrationReport:
 
 _PREPARED = False
 _LAST_REPORT: Optional[MigrationReport] = None
+_CHOSEN_DIR: Optional[str] = None
 
 
 def reset_prepare_cache() -> None:
-    global _PREPARED, _LAST_REPORT
+    global _PREPARED, _LAST_REPORT, _CHOSEN_DIR
     _PREPARED = False
     _LAST_REPORT = None
+    _CHOSEN_DIR = None
 
 
 def last_migration_report() -> Optional[MigrationReport]:
@@ -85,6 +90,7 @@ def copy_file_atomic(src: str, dest: str) -> None:
     try:
         shutil.copy2(src, tmp)
         os.replace(tmp, dest)
+        clear_readonly(dest)
     except Exception:
         try:
             if os.path.isfile(tmp):
@@ -191,21 +197,149 @@ def migrate_legacy_data_files(
     return report
 
 
+def _remove_probe_files(path: str) -> None:
+    for extra in (path, path + "-wal", path + "-shm"):
+        try:
+            if os.path.exists(extra):
+                clear_readonly(extra)
+                os.remove(extra)
+        except OSError:
+            pass
+
+
+def directory_supports_replace_and_wal(directory: str) -> bool:
+    """폴더에 파일을 만들고, 기존 파일을 교체하고, SQLite WAL을 쓸 수 있는지 확인한다."""
+    if not directory or not _dir_is_writable(directory):
+        return False
+    probe = os.path.join(directory, ".mm_replace_probe.json")
+    tmp = probe + ".tmp"
+    db_path = os.path.join(directory, ".mm_storage_probe.db")
+    try:
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write('{"probe":1}')
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write('{"probe":2}')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, probe)
+        with open(probe, "r", encoding="utf-8") as handle:
+            replaced = handle.read()
+        if '"probe": 2' not in replaced and '"probe":2' not in replaced:
+            return False
+        _remove_probe_files(db_path)
+        con = sqlite3.connect(db_path, timeout=5)
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA wal_autocheckpoint=0")
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("CREATE TABLE probe(id INTEGER)")
+            con.execute("INSERT INTO probe(id) VALUES (1)")
+            con.commit()
+            mode = con.execute("PRAGMA journal_mode").fetchone()
+            if not mode or str(mode[0]).lower() != "wal":
+                return False
+            if not (os.path.isfile(db_path + "-wal") or os.path.isfile(db_path + "-shm")):
+                return False
+        finally:
+            con.close()
+        return True
+    except (OSError, sqlite3.Error):
+        return False
+    finally:
+        for extra in (probe, tmp):
+            try:
+                if os.path.exists(extra):
+                    os.remove(extra)
+            except OSError:
+                pass
+        _remove_probe_files(db_path)
+
+
+def existing_state_is_writable(directory: str) -> bool:
+    for name in list(MIGRATABLE_FILES) + list(SQLITE_SIDECARS):
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
+            continue
+        if not clear_readonly(path) or not file_allows_write(path):
+            return False
+        if name == "sent_history.db":
+            try:
+                con = sqlite3.connect(path, timeout=5)
+                try:
+                    con.execute("BEGIN IMMEDIATE")
+                    con.commit()
+                    mode = con.execute("PRAGMA journal_mode=WAL").fetchone()
+                    if not mode or str(mode[0]).lower() != "wal":
+                        return False
+                finally:
+                    con.close()
+            except sqlite3.OperationalError as exc:
+                text = str(exc).lower()
+                if "locked" in text or "busy" in text:
+                    return True
+                return False
+            except sqlite3.Error:
+                return False
+    return True
+
+
+def storage_root_is_safe(directory: str) -> bool:
+    return directory_supports_replace_and_wal(directory) and existing_state_is_writable(directory)
+
+
+def _backup_then_copy(src: str, dest: str) -> None:
+    backup_dir = os.path.join(os.path.dirname(dest), "mm-backup")
+    os.makedirs(backup_dir, exist_ok=True)
+    backup = os.path.join(backup_dir, f"{os.path.basename(dest)}.{time.strftime('%Y%m%d%H%M%S')}")
+    shutil.copy2(src, backup)
+    clear_readonly(backup)
+    copy_file_atomic(src, dest)
+
+
+def chosen_data_dir() -> str:
+    override = (os.environ.get(DATA_DIR_ENV) or "").strip()
+    if override:
+        path = os.path.abspath(override)
+        os.makedirs(path, exist_ok=True)
+        return path
+    global _CHOSEN_DIR
+    if _CHOSEN_DIR:
+        return _CHOSEN_DIR
+    prepare_user_data()
+    return _CHOSEN_DIR or os.path.abspath(install_dir())
+
+
 def prepare_user_data(*, force: bool = False) -> MigrationReport:
-    """DB/설정 파일을 열기 전에 한 번 호출. 쓰기 가능 설치 폴더는 그대로 둔다."""
-    global _PREPARED, _LAST_REPORT
+    """저장 위치를 프로세스당 한 번 정한다. 안전하지 않으면 LocalAppData로 복사한다."""
+    global _PREPARED, _LAST_REPORT, _CHOSEN_DIR
     if _PREPARED and not force:
         return _LAST_REPORT or MigrationReport(used_portable=True)
-    inst = install_dir()
-    writable = _dir_is_writable(inst)
+    inst = os.path.abspath(install_dir())
     env_dest = (os.environ.get(DATA_DIR_ENV) or "").strip()
-    if writable:
-        dest = appdata_target_dir() if env_dest else inst
-        _LAST_REPORT = MigrationReport(used_portable=True, source_dir=inst, dest_dir=dest)
+    if env_dest:
+        dest = appdata_target_dir()
+        _CHOSEN_DIR = dest
+        if os.path.normcase(inst) == os.path.normcase(dest) or storage_root_is_safe(inst):
+            _LAST_REPORT = MigrationReport(used_portable=True, source_dir=inst, dest_dir=dest)
+        else:
+            _LAST_REPORT = migrate_legacy_data_files(
+                inst, dest, source_writable=False, copy_fn=_backup_then_copy
+            )
+        _PREPARED = True
+        return _LAST_REPORT
+    if storage_root_is_safe(inst):
+        _CHOSEN_DIR = inst
+        _LAST_REPORT = MigrationReport(used_portable=True, source_dir=inst, dest_dir=inst)
         _PREPARED = True
         return _LAST_REPORT
     dest = appdata_target_dir()
-    _LAST_REPORT = migrate_legacy_data_files(inst, dest, source_writable=False)
+    report = migrate_legacy_data_files(inst, dest, source_writable=False, copy_fn=_backup_then_copy)
+    if storage_root_is_safe(dest):
+        _CHOSEN_DIR = dest
+    else:
+        _CHOSEN_DIR = inst
+        report.failed.append(("storage-root", "UnsafeDestination"))
+    _LAST_REPORT = report
     _PREPARED = True
     return _LAST_REPORT
 

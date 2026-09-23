@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import sqlite3
 import threading
@@ -19,6 +20,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from business_hours import KST, as_kst
+from json_atomic import StorageWriteError, clear_readonly
 from smtp_credentials import public_smtp_snapshot, snapshot_contains_secrets
 
 JOB_QUEUED = "queued"
@@ -511,23 +513,69 @@ class CampaignStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._lock = threading.RLock()
+        existed = os.path.isfile(db_path)
+        folder = os.path.dirname(os.path.abspath(db_path)) or "."
         con = self._connect()
         try:
             ensure_campaign_schema(con)
             con.commit()
+        except sqlite3.OperationalError as exc:
+            self._discard_new_db(existed)
+            self._raise_storage_error(exc, folder)
+            raise
         finally:
             con.close()
-        self.scrub_stored_smtp_secrets()
+        try:
+            self.scrub_stored_smtp_secrets()
+        except sqlite3.OperationalError as exc:
+            self._raise_storage_error(exc, folder)
+            raise
 
     def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.db_path, timeout=30)
+        folder = os.path.dirname(os.path.abspath(self.db_path)) or "."
+        existed = os.path.isfile(self.db_path)
+        if existed:
+            clear_readonly(self.db_path)
+        try:
+            con = sqlite3.connect(self.db_path, timeout=30)
+        except sqlite3.OperationalError as exc:
+            self._discard_new_db(existed)
+            self._raise_storage_error(exc, folder)
+            raise
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA busy_timeout=30000")
         try:
             con.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.Error:
-            pass
+        except sqlite3.OperationalError as exc:
+            con.close()
+            self._discard_new_db(existed)
+            self._raise_storage_error(exc, folder)
+            raise
         return con
+
+    def _discard_new_db(self, existed: bool) -> None:
+        if existed or not os.path.isfile(self.db_path):
+            return
+        for extra in (self.db_path, self.db_path + "-wal", self.db_path + "-shm"):
+            try:
+                if os.path.isfile(extra):
+                    clear_readonly(extra)
+                    os.remove(extra)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _raise_storage_error(exc: sqlite3.OperationalError, folder: str) -> None:
+        text = str(exc).lower()
+        if "readonly" in text or "read-only" in text or "unable to open" in text:
+            raise StorageWriteError(
+                "발송 기록",
+                folder,
+                preserved=True,
+                retryable=True,
+                relaunch=True,
+                reason="데이터베이스가 읽기 전용이거나 보조 파일을 만들 수 없습니다.",
+            ) from exc
 
     def scrub_stored_smtp_secrets(self) -> int:
         """기존 캠페인 스냅샷에 남아 있을 수 있는 비밀번호를 제거한다. 값은 로그하지 않는다."""

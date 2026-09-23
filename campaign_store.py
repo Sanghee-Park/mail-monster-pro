@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from business_hours import KST, as_kst
-from json_atomic import StorageWriteError, clear_readonly, has_readonly_attribute
+from json_atomic import StorageWriteError, clear_readonly
 from smtp_credentials import public_smtp_snapshot, snapshot_contains_secrets
 
 JOB_QUEUED = "queued"
@@ -533,37 +533,43 @@ class CampaignStore:
 
     def _connect(self) -> sqlite3.Connection:
         folder = os.path.dirname(os.path.abspath(self.db_path)) or "."
-        existed = os.path.isfile(self.db_path)
-        if existed and has_readonly_attribute(self.db_path):
-            clear_readonly(self.db_path)
-        con = None
-        for attempt in range(4):
+        last: Optional[sqlite3.OperationalError] = None
+        for attempt in range(2):
             try:
                 con = sqlite3.connect(self.db_path, timeout=30)
-                break
             except sqlite3.OperationalError as exc:
-                text = str(exc).lower()
-                if "readonly" in text or "read-only" in text:
-                    self._discard_new_db(existed)
-                    self._raise_storage_error(exc, folder)
-                    raise
-                transient = "unable to open" in text or "locked" in text or "busy" in text
-                if not transient or attempt >= 3:
-                    self._discard_new_db(existed)
-                    raise
-                time.sleep(0.05 * (attempt + 1))
-        if con is None:
-            raise sqlite3.OperationalError("unable to open database file")
-        con.row_factory = sqlite3.Row
-        con.execute("PRAGMA busy_timeout=30000")
-        try:
-            con.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.OperationalError as exc:
-            con.close()
-            self._discard_new_db(existed)
-            self._raise_storage_error(exc, folder)
-            raise
-        return con
+                last = exc
+                if attempt == 0 and self._retry_after_readonly(exc):
+                    continue
+                self._raise_storage_error(exc, folder)
+                raise
+            con.row_factory = sqlite3.Row
+            con.execute("PRAGMA busy_timeout=30000")
+            try:
+                con.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError as exc:
+                if not self._is_readonly_error(exc):
+                    return con
+                con.close()
+                last = exc
+                if attempt == 0 and self._retry_after_readonly(exc):
+                    continue
+                self._raise_storage_error(exc, folder)
+                raise
+            return con
+        if last:
+            raise last
+        raise sqlite3.OperationalError("unable to open database file")
+
+    @staticmethod
+    def _is_readonly_error(exc: sqlite3.OperationalError) -> bool:
+        text = str(exc).lower()
+        return "readonly" in text or "read-only" in text
+
+    def _retry_after_readonly(self, exc: sqlite3.OperationalError) -> bool:
+        if not self._is_readonly_error(exc):
+            return False
+        return bool(os.path.isfile(self.db_path) and clear_readonly(self.db_path))
 
     def _discard_new_db(self, existed: bool) -> None:
         if existed or not os.path.isfile(self.db_path):

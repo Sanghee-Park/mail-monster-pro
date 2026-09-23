@@ -71,18 +71,29 @@ def is_transient_lock_error(exc: BaseException) -> bool:
     return False
 
 
+def _win_file_attributes(path: str):
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetFileAttributesW.argtypes = (ctypes.c_wchar_p,)
+        kernel.GetFileAttributesW.restype = ctypes.c_uint32
+        attrs = kernel.GetFileAttributesW(str(path))
+        if attrs == 0xFFFFFFFF:
+            return None
+        return int(attrs)
+    except Exception:
+        return None
+
+
 def has_readonly_attribute(path: str) -> bool:
     if not path or not os.path.exists(path):
         return False
     if os.name == "nt":
-        try:
-            import ctypes
-
-            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
-            if attrs != 0xFFFFFFFF and attrs & 0x1:
-                return True
-        except Exception:
-            pass
+        attrs = _win_file_attributes(path)
+        return bool(attrs is not None and attrs & 0x1)
     try:
         return not bool(os.stat(path).st_mode & stat.S_IWRITE)
     except OSError:
@@ -100,7 +111,11 @@ def clear_readonly(path: str) -> bool:
         try:
             import ctypes
 
-            kernel = ctypes.windll.kernel32
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.GetFileAttributesW.argtypes = (ctypes.c_wchar_p,)
+            kernel.GetFileAttributesW.restype = ctypes.c_uint32
+            kernel.SetFileAttributesW.argtypes = (ctypes.c_wchar_p, ctypes.c_uint32)
+            kernel.SetFileAttributesW.restype = ctypes.c_int
             attrs = kernel.GetFileAttributesW(str(path))
             if attrs != 0xFFFFFFFF and attrs & 0x1:
                 kernel.SetFileAttributesW(str(path), attrs & ~0x1)

@@ -311,10 +311,10 @@ class ModernMailSender(ctk.CTk):
         self.after(400, self._recover_campaigns_if_any)
 
     def init_db(self):
-        from json_atomic import clear_readonly
+        from json_atomic import clear_readonly, has_readonly_attribute
 
         folder = os.path.dirname(os.path.abspath(self.db_path)) or "."
-        if os.path.isfile(self.db_path):
+        if os.path.isfile(self.db_path) and has_readonly_attribute(self.db_path):
             clear_readonly(self.db_path)
         existed = os.path.isfile(self.db_path)
         try:

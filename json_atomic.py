@@ -71,6 +71,24 @@ def is_transient_lock_error(exc: BaseException) -> bool:
     return False
 
 
+def has_readonly_attribute(path: str) -> bool:
+    if not path or not os.path.exists(path):
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+            if attrs != 0xFFFFFFFF and attrs & 0x1:
+                return True
+        except Exception:
+            pass
+    try:
+        return not bool(os.stat(path).st_mode & stat.S_IWRITE)
+    except OSError:
+        return False
+
+
 def clear_readonly(path: str) -> bool:
     if not path or not os.path.exists(path):
         return True

@@ -51,21 +51,9 @@ def _dir_is_writable(path: str) -> bool:
 
 
 def user_data_dir() -> str:
-    from data_migrate import prepare_user_data
+    from data_migrate import chosen_data_dir
 
-    prepare_user_data()
-    override = (os.environ.get(DATA_DIR_ENV) or "").strip()
-    if override:
-        abs_d = os.path.abspath(override)
-        os.makedirs(abs_d, exist_ok=True)
-        return abs_d
-    inst = install_dir()
-    if _dir_is_writable(inst):
-        return inst
-    local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
-    target = os.path.join(local, APP_DATA_FOLDER)
-    os.makedirs(target, exist_ok=True)
-    return os.path.abspath(target)
+    return chosen_data_dir()
 
 
 def data_file(name: str) -> str:
@@ -74,11 +62,7 @@ def data_file(name: str) -> str:
 
 
 def find_existing_file(name: str) -> str:
-    """기존 파일이 있으면 그 위치를 쓰고, 없으면 사용자 데이터 폴더 경로를 반환."""
-    for folder in (user_data_dir(), install_dir()):
-        path = os.path.join(folder, name)
-        if os.path.isfile(path):
-            return path
+    """확정된 데이터 폴더 안의 파일만 사용한다. 실행 폴더와 나누어 찾지 않는다."""
     return data_file(name)
 
 
@@ -98,17 +82,7 @@ def bundled_file(name: str) -> str:
 
 
 def writable_file(name: str) -> str:
-    """기존 파일이 있고 그 경로에 쓸 수 있으면 유지, 아니면 사용자 데이터 폴더."""
-    existing = find_existing_file(name)
-    if os.path.isfile(existing):
-        folder = os.path.dirname(existing)
-        if _dir_is_writable(folder):
-            return existing
-        return data_file(name)
-    preferred = data_file(name)
-    parent = os.path.dirname(preferred)
-    if _dir_is_writable(parent) or parent == user_data_dir():
-        return preferred
+    """시작 시 확정된 데이터 폴더의 절대경로."""
     return data_file(name)
 
 

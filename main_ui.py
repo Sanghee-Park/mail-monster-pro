@@ -60,6 +60,7 @@ from app_paths import (
 from smtp_credentials import public_smtp_snapshot, resolve_smtp_for_send, snapshot_contains_secrets
 from ui_safe import schedule_on_ui
 from ui_dialogs import UiDialogManager, live_ui_parent, is_usable_parent, is_widget_alive
+from json_atomic import StorageWriteError, atomic_write_json, read_json_object, update_json_object
 from recipient_import import parse_recipient_excel_files, start_excel_import
 from template_prefs import ensure_template_ids, find_template_by_id, template_id_for_name
 
@@ -264,7 +265,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.8.2"
+            CURRENT_VERSION = "v2.8.4"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686")  # 기본 크기
         self.minsize(800, 520)  # 축소 시 레이아웃 붕괴·버튼 소실 방지
@@ -292,8 +293,13 @@ class ModernMailSender(ctk.CTk):
             self._atomic_write_json_path(self.recipients_file, {}, indent=2, ensure_ascii=False)
         self._recovery_started = False
         self._migrate_legacy_sender_profile_once()
-        self.init_db()
-        self.campaign_store = CampaignStore(self.db_path)
+        try:
+            self.init_db()
+            self.campaign_store = CampaignStore(self.db_path)
+        except StorageWriteError as exc:
+            self.campaign_store = None
+            messagebox.showerror("저장 오류", str(exc))
+            raise
         self.campaign_store.migrate_recipient_state(
             self.login_user_id,
             self._read_recipients_state_all(),
@@ -305,7 +311,25 @@ class ModernMailSender(ctk.CTk):
         self.after(400, self._recover_campaigns_if_any)
 
     def init_db(self):
-        con = sqlite3.connect(self.db_path)
+        from json_atomic import clear_readonly, has_readonly_attribute
+
+        folder = os.path.dirname(os.path.abspath(self.db_path)) or "."
+        if os.path.isfile(self.db_path) and has_readonly_attribute(self.db_path):
+            clear_readonly(self.db_path)
+        existed = os.path.isfile(self.db_path)
+        try:
+            con = sqlite3.connect(self.db_path)
+        except sqlite3.OperationalError as exc:
+            if "readonly" in str(exc).lower():
+                raise StorageWriteError(
+                    "발송 기록",
+                    folder,
+                    preserved=existed,
+                    retryable=True,
+                    relaunch=True,
+                    reason="데이터베이스가 읽기 전용입니다.",
+                ) from exc
+            raise
         try:
             con.execute(
                 """
@@ -376,21 +400,51 @@ class ModernMailSender(ctk.CTk):
                 """
             )
             con.execute("CREATE INDEX IF NOT EXISTS idx_blacklist_email ON blacklist(email)")
-            
             con.commit()
+        except sqlite3.OperationalError as exc:
+            if not existed:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+                try:
+                    if os.path.isfile(self.db_path):
+                        os.remove(self.db_path)
+                except OSError:
+                    pass
+            if "readonly" in str(exc).lower():
+                raise StorageWriteError(
+                    "발송 기록",
+                    folder,
+                    preserved=True,
+                    retryable=True,
+                    relaunch=True,
+                    reason="데이터베이스가 읽기 전용입니다.",
+                ) from exc
+            raise
         finally:
-            con.close()
+            try:
+                con.close()
+            except Exception:
+                pass
 
     def _read_recipients_state_all(self):
-        try:
-            with open(self.recipients_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+        return read_json_object(self.recipients_file)
 
     def _write_recipients_state_all(self, data):
-        self._atomic_write_json_path(self.recipients_file, data, indent=2, ensure_ascii=False)
+        atomic_write_json(self.recipients_file, data, indent=2, ensure_ascii=False, kind="수신처 목록")
+
+    def _notify_storage_error(self, exc: StorageWriteError):
+        key = self._live_task_key()
+        if key:
+            provider, idx = self._split_task_key(key)
+            self.write_log(provider, idx, "❌ " + str(exc).replace("\n", " "))
+        parent = live_ui_parent(self)
+
+        def show():
+            messagebox.showerror("저장 오류", str(exc), parent=parent if is_usable_parent(parent) else None)
+
+        schedule_on_ui(self, show)
 
     def load_recipients_state(self, task_key, *, include_rows=False):
         data = self._read_recipients_state_all()
@@ -411,37 +465,39 @@ class ModernMailSender(ctk.CTk):
         return state
 
     def save_recipients_rows(self, task_key, rows, headers=None):
-        data = self._read_recipients_state_all()
-        state = data.get(task_key) or {}
-        if isinstance(state, list):
-            state = {"rows": state, "last_sent": {}, "headers": []}
-        if not isinstance(state, dict):
-            state = {}
-        state.setdefault("last_sent", {})
-        state["rows"] = rows
-        if headers:
-            state["headers"] = headers
         canonical_rows = list(rows or [])
-        result = None
-        if self.campaign_store:
-            result = self.campaign_store.replace_account_recipients(
-                self.login_user_id,
-                task_key,
-                canonical_rows,
-            )
-            state["rows"] = []
-            state["row_count"] = int((result or {}).get("total") or 0)
-        else:
-            state["rows"] = canonical_rows
-        data[task_key] = state
-        if self.campaign_store and self.campaign_store.recipient_state_migrated(self.login_user_id):
-            for key, value in list(data.items()):
-                if isinstance(value, dict) and value.get("rows"):
-                    copied = dict(value)
-                    copied["rows"] = []
-                    data[key] = copied
-        self._write_recipients_state_all(data)
-        return result or {"total": len(canonical_rows)}
+        result_box = {}
+
+        def mutate(data):
+            state = data.get(task_key) or {}
+            if isinstance(state, list):
+                state = {"rows": state, "last_sent": {}, "headers": []}
+            if not isinstance(state, dict):
+                state = {}
+            state.setdefault("last_sent", {})
+            if headers:
+                state["headers"] = headers
+            if self.campaign_store:
+                result_box["result"] = self.campaign_store.replace_account_recipients(
+                    self.login_user_id,
+                    task_key,
+                    canonical_rows,
+                )
+                state["rows"] = []
+                state["row_count"] = int((result_box["result"] or {}).get("total") or 0)
+            else:
+                state["rows"] = canonical_rows
+                result_box["result"] = {"total": len(canonical_rows)}
+            data[task_key] = state
+            if self.campaign_store and self.campaign_store.recipient_state_migrated(self.login_user_id):
+                for key, value in list(data.items()):
+                    if isinstance(value, dict) and value.get("rows"):
+                        copied = dict(value)
+                        copied["rows"] = []
+                        data[key] = copied
+
+        update_json_object(self.recipients_file, mutate, indent=2, ensure_ascii=False, kind="수신처 목록")
+        return result_box.get("result") or {"total": len(canonical_rows)}
 
     def _show_dialog_error(self, msg, tb=""):
         parent = live_ui_parent(self)
@@ -487,7 +543,13 @@ class ModernMailSender(ctk.CTk):
                         merged_headers.append(col)
                 source_rows = list(parsed.get("rows") or [])
                 combined = existing_rows + source_rows
-                saved = self.save_recipients_rows(task_key, combined, merged_headers)
+                try:
+                    saved = self.save_recipients_rows(task_key, combined, merged_headers)
+                except StorageWriteError as exc:
+                    parsed["storage_error"] = str(exc)
+                    parsed["saved"] = False
+                    return parsed
+                parsed["saved"] = True
                 parsed["source_count"] = len(source_rows)
                 parsed["combined_count"] = int((saved or {}).get("total") or 0)
                 parsed["duplicate_count"] = int((saved or {}).get("duplicates") or 0)
@@ -539,6 +601,14 @@ class ModernMailSender(ctk.CTk):
 
     def _apply_excel_import_result(self, task_key, generation, result):
         result = result or {}
+        if result.get("storage_error"):
+            parent = live_ui_parent(self)
+            messagebox.showerror(
+                "저장 오류",
+                str(result.get("storage_error")),
+                parent=parent if is_usable_parent(parent) else None,
+            )
+            return
         current = self._live_task_key() == task_key and int(getattr(self, "_bind_generation", 0) or 0) == int(generation or 0)
         if result.get("error"):
             if current:
@@ -576,21 +646,25 @@ class ModernMailSender(ctk.CTk):
             )
 
     def update_last_sent_state(self, task_key, no, comp, email):
-        data = self._read_recipients_state_all()
-        state = data.get(task_key) or {}
-        if isinstance(state, list):
-            state = {"rows": state, "last_sent": {}}
-        if not isinstance(state, dict):
-            state = {}
-        state.setdefault("rows", [])
-        state["last_sent"] = {
-            "no": int(no) if str(no).isdigit() else no,
-            "comp": comp,
-            "email": email,
-            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        data[task_key] = state
-        self._write_recipients_state_all(data)
+        def mutate(data):
+            state = data.get(task_key) or {}
+            if isinstance(state, list):
+                state = {"rows": state, "last_sent": {}}
+            if not isinstance(state, dict):
+                state = {}
+            state.setdefault("rows", [])
+            state["last_sent"] = {
+                "no": int(no) if str(no).isdigit() else no,
+                "comp": comp,
+                "email": email,
+                "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            data[task_key] = state
+
+        try:
+            update_json_object(self.recipients_file, mutate, indent=2, ensure_ascii=False, kind="수신처 목록")
+        except StorageWriteError as exc:
+            self._notify_storage_error(exc)
 
     def _effective_template_for_log(self, template_name, subject):
         """Task 4-4: template_name이 비어 있으면 제목으로 대체해 DB·시트·중복키가 빈 문자열이 되지 않게 함."""
@@ -1078,7 +1152,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.8.3"
+            _ver = "v2.8.4"
 
         title_lbl = ctk.CTkLabel(
             header,
@@ -1220,21 +1294,10 @@ class ModernMailSender(ctk.CTk):
             return {}
 
     def _atomic_write_json_path(self, path, data, indent=4, ensure_ascii=False):
-        """Task 7-4: JSON 파일 원자적 저장(임시 파일 후 os.replace)."""
-        path = os.path.abspath(path)
-        dname = os.path.dirname(path) or "."
-        fd, tmp = tempfile.mkstemp(prefix="mm_json_", suffix=".tmp", dir=dname)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=indent, ensure_ascii=ensure_ascii)
-            os.replace(tmp, path)
-        except Exception:
-            try:
-                if os.path.isfile(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
-            raise
+        """JSON 원자적 저장. 실패하면 기존 파일은 그대로 둔다."""
+        name = os.path.basename(str(path)).lower()
+        kind = "수신처 목록" if "recipient" in name else "설정 파일"
+        atomic_write_json(path, data, indent=indent, ensure_ascii=ensure_ascii, kind=kind)
 
     def _atomic_write_config(self, data):
         """config.json 원자적 저장."""
@@ -1451,10 +1514,14 @@ class ModernMailSender(ctk.CTk):
         if isinstance(order, list):
             cfg[CONFIG_META_ACCOUNT_ORDER_KEY] = [x for x in order if x != task_key]
         self._atomic_write_config(cfg)
-        rdata = self._read_recipients_state_all()
-        if task_key in rdata:
-            del rdata[task_key]
-            self._write_recipients_state_all(rdata)
+        def _drop_recipient(data):
+            if task_key in data:
+                del data[task_key]
+
+        try:
+            update_json_object(self.recipients_file, _drop_recipient, indent=2, ensure_ascii=False, kind="수신처 목록")
+        except StorageWriteError as exc:
+            self._notify_storage_error(exc)
         self._clear_account_ui_data(task_key)
         self._unconfigured_visible = [key for key in self._unconfigured_visible if key != task_key]
         self._compose_drafts.pop(task_key, None)
@@ -3789,6 +3856,8 @@ class ModernMailSender(ctk.CTk):
                     generation=bound_generation,
                 )
             self._start_campaign_runner(job["job_id"], key, s_b, st_b)
+        except StorageWriteError as exc:
+            self._notify_storage_error(exc)
         except DuplicateActiveCampaignError as e:
             self.write_log(p, i, "❌ 이미 이 SMTP 계정으로 실행 중인 자동발송이 있습니다.")
             schedule_on_ui(

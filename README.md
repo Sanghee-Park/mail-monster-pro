@@ -2,7 +2,7 @@
 
 Windows용 이메일 자동 발송 애플리케이션 (CustomTkinter + SMTP + 구글 시트 연동)
 
-현재 버전: **v2.8.3**
+현재 버전: **v2.8.4**
 
 ## 요구 사항
 
@@ -15,7 +15,7 @@ Windows용 이메일 자동 발송 애플리케이션 (CustomTkinter + SMTP + �
 python main.py
 ```
 
-PyInstaller로 만든 EXE는 작업 디렉터리와 관계없이 실행 파일 위치(`sys.executable`)와, 쓰기가 막힌 경우 `%LOCALAPPDATA%\MAIL_MONSTER_PRO`를 사용합니다. 개발 실행은 `__file__` 기준입니다.
+PyInstaller로 만든 EXE는 작업 디렉터리와 관계없이 실행 파일 위치(`sys.executable`)와, 쓰기가 막힌 경우 `%LOCALAPPDATA%\MAIL_MONSTER_PRO`를 사용합니다. 개발 실행은 `__file__` 기준입니다. v2.8.4부터는 파일 교체와 SQLite WAL 쓰기가 될 때만 그 폴더를 저장 위치로 확정하고, 저장에 실패해도 기존 `recipients.json`과 `sent_history.db`를 지우거나 빈 파일로 바꾸지 않습니다.
 
 Inno Setup 기본 설치 폴더(`Program Files\MAIL MONSTER PRO`)가 쓰기 불가능하면, v2.7.3에서 실행 파일 옆에 있던 `sent_history.db`, `login_settings.json`, `config.json`, `recipients.json`, `templates.json`, `user_profiles.json`, `extra_holidays.json`을 사용자 폴더로 **1회 복사**합니다. 원본은 삭제하지 않고, 대상에 같은 파일이 있으면 덮어쓰지 않습니다. 데스크톱 등 쓰기 가능한 포터블 폴더는 이동하지 않습니다.
 
@@ -25,7 +25,7 @@ Inno Setup 기본 설치 폴더(`Program Files\MAIL MONSTER PRO`)가 쓰기 불�
 2. 구글 시트 연동 시 설치 폴더에 `credentials.json`(서비스 계정)을 둡니다.
 3. 로그인 화면에서 **자동 로그인**을 켜 두면, Windows 재부팅 후 예약 발송을 이어서 진행할 수 있습니다.
 
-## 발송 정책 (v2.8.3)
+## 발송 정책 (v2.8.4)
 
 - **영업일·시간**: 대한민국 표준시(KST) 기준 월~금, **09:00 정각부터 18:00 직전**까지. 주말·법정공휴일·대체공휴일·근로자의 날·임시공휴일은 발송하지 않습니다.
 - **예약 대기**: 업무시간 외에 시작해도 오류로 끝나지 않고 `scheduled_pause`로 저장됩니다. 다음 영업일 09:00에 자동 재개합니다.

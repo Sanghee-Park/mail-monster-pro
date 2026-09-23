@@ -93,10 +93,9 @@ def ensure_extra_holidays_file(path: str) -> None:
     }
     dname = os.path.dirname(path) or "."
     os.makedirs(dname, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    from json_atomic import atomic_write_json
+
+    atomic_write_json(path, payload, indent=2, ensure_ascii=False, kind="임시공휴일 목록")
 
 
 def _build_kr_calendar(years: Optional[Iterable[int]] = None):

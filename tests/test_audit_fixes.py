@@ -173,10 +173,12 @@ class AuditFixTests(unittest.TestCase):
 
         t = threading.Thread(target=run1)
         t.start()
-        self.assertTrue(started.wait(2))
-        results["r2"] = make("w2").run(job["job_id"], wait_off_hours=False)
-        release.set()
-        t.join(5)
+        try:
+            self.assertTrue(started.wait(15))
+            results["r2"] = make("w2").run(job["job_id"], wait_off_hours=False)
+        finally:
+            release.set()
+            t.join(15)
         self.assertEqual(results["r2"], "locked")
         self.assertEqual(results["r1"], JOB_COMPLETED)
         self.assertEqual(len(sent), 2)

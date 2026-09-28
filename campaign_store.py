@@ -20,6 +20,8 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from business_hours import KST, as_kst
+from db_access import connect as connect_database
+from db_access import journal_blocks_item, load_recovery_journal, mark_journal_applied
 from json_atomic import StorageWriteError, clear_readonly
 from smtp_credentials import public_smtp_snapshot, snapshot_contains_secrets
 
@@ -514,62 +516,61 @@ class CampaignStore:
         self.db_path = db_path
         self._lock = threading.RLock()
         existed = os.path.isfile(db_path)
-        folder = os.path.dirname(os.path.abspath(db_path)) or "."
-        con = self._connect()
+        con = None
         try:
+            con = self._connect()
             ensure_campaign_schema(con)
             con.commit()
+        except StorageWriteError:
+            self._discard_new_db(existed)
+            raise
         except sqlite3.OperationalError as exc:
             self._discard_new_db(existed)
-            self._raise_storage_error(exc, folder)
             raise
         finally:
-            con.close()
-        try:
-            self.scrub_stored_smtp_secrets()
-        except sqlite3.OperationalError as exc:
-            self._raise_storage_error(exc, folder)
-            raise
-
-    def _connect(self) -> sqlite3.Connection:
-        folder = os.path.dirname(os.path.abspath(self.db_path)) or "."
-        last: Optional[sqlite3.OperationalError] = None
-        for attempt in range(2):
-            try:
-                con = sqlite3.connect(self.db_path, timeout=30)
-            except sqlite3.OperationalError as exc:
-                last = exc
-                if attempt == 0 and self._retry_after_readonly(exc):
-                    continue
-                self._raise_storage_error(exc, folder)
-                raise
-            con.row_factory = sqlite3.Row
-            con.execute("PRAGMA busy_timeout=30000")
-            try:
-                con.execute("PRAGMA journal_mode=WAL")
-            except sqlite3.OperationalError as exc:
-                if not self._is_readonly_error(exc):
-                    return con
+            if con is not None:
                 con.close()
-                last = exc
-                if attempt == 0 and self._retry_after_readonly(exc):
-                    continue
-                self._raise_storage_error(exc, folder)
-                raise
-            return con
-        if last:
-            raise last
-        raise sqlite3.OperationalError("unable to open database file")
+        self.scrub_stored_smtp_secrets()
+        try:
+            self.restore_recovery_journal()
+        except StorageWriteError:
+            pass
 
-    @staticmethod
-    def _is_readonly_error(exc: sqlite3.OperationalError) -> bool:
-        text = str(exc).lower()
-        return "readonly" in text or "read-only" in text
+    def restore_recovery_journal(self) -> int:
+        """복구 저널의 항목은 pending 으로 되돌리지 않고 확인 필요 상태로 둔다."""
+        restored = 0
+        for row in load_recovery_journal():
+            if row.get("status") == "restored":
+                continue
+            try:
+                item_id = int(row.get("item_id"))
+            except (TypeError, ValueError):
+                continue
+            item = self.get_item(item_id)
+            if not item:
+                continue
+            if item.get("status") in (ITEM_PENDING, ITEM_SENDING):
+                self.mark_item(
+                    item_id,
+                    ITEM_NEEDS_REVIEW,
+                    error_message="SMTP 접수 여부가 확인되지 않아 자동 재발송하지 않습니다.",
+                )
+                job_id = item.get("job_id")
+                if job_id:
+                    job = self.get_job(job_id) or {}
+                    if job.get("status") in (JOB_RUNNING, JOB_QUEUED, JOB_SCHEDULED_PAUSE, JOB_COMPLETED):
+                        self.set_needs_attention(
+                            job_id,
+                            "발송 기록을 저장할 수 없어 자동발송을 안전하게 중단했습니다. 확인 전에 다시 보내지 않습니다.",
+                        )
+                restored += 1
+            mark_journal_applied(item_id)
+        return restored
 
-    def _retry_after_readonly(self, exc: sqlite3.OperationalError) -> bool:
-        if not self._is_readonly_error(exc):
-            return False
-        return bool(os.path.isfile(self.db_path) and clear_readonly(self.db_path))
+    def _connect(self):
+        con = connect_database(self.db_path, kind="발송 기록")
+        con.row_factory = sqlite3.Row
+        return con
 
     def _discard_new_db(self, existed: bool) -> None:
         if existed or not os.path.isfile(self.db_path):
@@ -1826,13 +1827,21 @@ class CampaignStore:
                 item["claimed_by_task_key"] = task_key or ""
                 item["recipient"] = _json_loads(item.get("recipient_json"), {})
                 return item, False
+            except StorageWriteError:
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
+                raise
             except sqlite3.OperationalError:
                 try:
                     con.rollback()
                 except Exception:
                     pass
                 return None, True
-            except Exception:
+            except Exception as exc:
+                if isinstance(exc, StorageWriteError):
+                    raise
                 try:
                     con.rollback()
                 except Exception:
@@ -2127,6 +2136,22 @@ class CampaignStore:
                             )
                         stats["sent"] += 1
                         continue
+                    if journal_blocks_item(item["id"]) or (attempts <= 0 and mid):
+                        con.execute(
+                            """
+                            UPDATE campaign_queue
+                            SET status=?, error_message=?, processed_at=?
+                            WHERE id=?
+                            """,
+                            (
+                                ITEM_NEEDS_REVIEW,
+                                "SMTP 접수 여부가 확인되지 않아 자동 재발송하지 않습니다. 수신함·발송 로그를 확인한 뒤 처리하세요.",
+                                _now_iso(now),
+                                item["id"],
+                            ),
+                        )
+                        stats["review"] += 1
+                        continue
                     if attempts <= 0 and not mid:
                         con.execute(
                             "UPDATE campaign_queue SET status=? WHERE id=? AND status=?",
@@ -2268,7 +2293,15 @@ class CampaignStore:
                 )
                 con.commit()
                 return True
-            except Exception:
+            except StorageWriteError:
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
+                raise
+            except Exception as exc:
+                if isinstance(exc, StorageWriteError):
+                    raise
                 try:
                     con.rollback()
                 except Exception:
@@ -2338,13 +2371,21 @@ class CampaignStore:
                 )
                 con.commit()
                 return True
+            except StorageWriteError:
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
+                raise
             except sqlite3.OperationalError:
                 try:
                     con.rollback()
                 except Exception:
                     pass
                 return False
-            except Exception:
+            except Exception as exc:
+                if isinstance(exc, StorageWriteError):
+                    raise
                 try:
                     con.rollback()
                 except Exception:

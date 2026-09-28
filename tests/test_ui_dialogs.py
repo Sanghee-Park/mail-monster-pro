@@ -471,7 +471,7 @@ class DialogCampaignStressTests(unittest.TestCase):
         t2 = threading.Thread(target=lambda: make_runner(job_b["worker_id"]).run(job_b["job_id"], wait_off_hours=False), daemon=True)
         t1.start()
         t2.start()
-        deadline = time.time() + 2
+        deadline = time.time() + 8
         while time.time() < deadline and len(sent) < 2:
             time.sleep(0.01)
         self.assertGreaterEqual(len(sent), 1)

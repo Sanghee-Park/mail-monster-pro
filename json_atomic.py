@@ -29,6 +29,10 @@ class StorageWriteError(OSError):
         retryable: bool = True,
         relaunch: bool = False,
         reason: str = "",
+        category: str = "",
+        db_path: str = "",
+        smtp_phase: str = "",
+        auto_resend_blocked: bool = False,
     ):
         self.kind = kind
         self.folder = folder
@@ -36,6 +40,19 @@ class StorageWriteError(OSError):
         self.retryable = retryable
         self.relaunch = relaunch
         self.reason = reason
+        self.category = category
+        self.db_path = db_path
+        self.smtp_phase = smtp_phase
+        self.auto_resend_blocked = auto_resend_blocked
+        if smtp_phase in ("after", "uncertain"):
+            super().__init__(
+                "발송 기록을 저장할 수 없어 자동발송을 안전하게 중단했습니다.\n\n"
+                f"데이터 폴더: {folder}\n"
+                "현재 메일은 서버에 접수되었을 가능성이 있어 자동으로 다시 발송하지 않습니다.\n"
+                "보낸메일함 또는 SMTP 발송 기록을 확인한 뒤 ‘확인 필요 해결’에서 처리해 주세요.\n"
+                "기존 수신처와 발송 기록은 삭제하지 않았습니다."
+            )
+            return
         lines = [
             f"{kind} 저장에 실패했습니다.",
             f"데이터 폴더: {folder}",

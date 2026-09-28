@@ -1,12 +1,21 @@
 """캠페인 발송 루프 (SMTP/UI와 분리, 테스트에서 mock 가능)."""
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from typing import Callable, Optional, Tuple
 
 from business_hours import BusinessHours, as_kst
 from campaign_attachments import format_missing_files_reason, missing_attachment_paths
+from db_access import (
+    append_recovery_journal,
+    assert_immediate_write,
+    block_writes,
+    format_storage_log,
+    writes_blocked,
+)
+from json_atomic import StorageWriteError
 from campaign_store import (
     ITEM_FAILED,
     ITEM_NEEDS_REVIEW,
@@ -150,6 +159,58 @@ class CampaignRunner:
             self.store.set_status(job_id, status, now=self.now(), clear_runner=True)
         self._progress(job_id)
         return status
+
+    def _stop_for_storage(self, job_id: str, item: Optional[dict], exc: StorageWriteError, phase: str) -> str:
+        block_writes()
+        if not exc.smtp_phase:
+            exc.smtp_phase = phase
+        exc.auto_resend_blocked = True
+        if phase in ("after", "uncertain"):
+            exc.smtp_phase = phase
+        try:
+            append_recovery_journal(
+                {
+                    "job_id": job_id,
+                    "item_id": (item or {}).get("id"),
+                    "task_key": (item or {}).get("task_key") or (item or {}).get("claimed_by_task_key") or "",
+                    "message_id": (item or {}).get("message_id") or "",
+                    "at": self.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "needs_review",
+                    "smtp_phase": phase,
+                }
+            )
+        except Exception:
+            pass
+        if item and item.get("id") is not None:
+            try:
+                self.store.mark_item(
+                    item["id"],
+                    ITEM_NEEDS_REVIEW,
+                    error_message="SMTP 접수 여부가 확인되지 않아 자동 재발송하지 않습니다.",
+                    now=self.now(),
+                )
+            except Exception:
+                pass
+        shown = exc
+        if phase in ("after", "uncertain"):
+            shown = StorageWriteError(
+                exc.kind or "발송 기록",
+                exc.folder,
+                preserved=True,
+                retryable=False,
+                relaunch=True,
+                category=exc.category or "io",
+                db_path=exc.db_path,
+                smtp_phase=phase,
+                auto_resend_blocked=True,
+            )
+        self.on_log(format_storage_log(shown, operation="발송 기록"))
+        text = str(shown)
+        try:
+            return self._halt_worker(job_id, text)
+        except Exception:
+            self.on_log(text)
+            return JOB_NEEDS_ATTENTION
 
     def _halt_worker(self, job_id: str, reason: str) -> str:
         if self.worker_id:
@@ -420,8 +481,29 @@ class CampaignRunner:
                 self._progress(job_id)
                 return None
 
+            try:
+                if writes_blocked():
+                    raise StorageWriteError(
+                        "발송 기록",
+                        os.path.dirname(os.path.abspath(self.store.db_path)) or ".",
+                        preserved=True,
+                        retryable=False,
+                        relaunch=True,
+                        reason="이전 저장 실패로 자동발송이 중단된 상태입니다.",
+                        category="readonly",
+                        db_path=os.path.abspath(self.store.db_path),
+                        smtp_phase="before",
+                        auto_resend_blocked=True,
+                    )
+                assert_immediate_write(self.store.db_path)
+            except StorageWriteError as exc:
+                return self._stop_for_storage(job_id, item, exc, "before")
+
             self.smtp_calls += 1
-            ok, err = self.send_once_fn(payload, job, live)
+            try:
+                ok, err = self.send_once_fn(payload, job, live)
+            except StorageWriteError as exc:
+                return self._stop_for_storage(job_id, item, exc, "after")
             attempts_done += 1
             self.store.mark_item(
                 item["id"],
@@ -432,11 +514,14 @@ class CampaignRunner:
                 message_id=item.get("message_id"),
             )
             if ok:
-                self.store.mark_item(item["id"], ITEM_SENT, now=self.now(), message_id=item.get("message_id"))
-                self.store.set_reservation_status(reservation_id, "sent", now=self.now())
-                self._bump("sent")
-                self.store.refresh_counts(job_id)
-                self._progress(job_id)
+                try:
+                    self.store.mark_item(item["id"], ITEM_SENT, now=self.now(), message_id=item.get("message_id"))
+                    self.store.set_reservation_status(reservation_id, "sent", now=self.now())
+                    self._bump("sent")
+                    self.store.refresh_counts(job_id)
+                    self._progress(job_id)
+                except StorageWriteError as exc:
+                    return self._stop_for_storage(job_id, item, exc, "after")
                 return "did_smtp"
             last_err = err or ""
             low = last_err.lower()
@@ -580,6 +665,20 @@ class CampaignRunner:
         need_wait_before_smtp = False
         try:
             while True:
+                if writes_blocked():
+                    blocked = StorageWriteError(
+                        "발송 기록",
+                        os.path.dirname(os.path.abspath(self.store.db_path)) or ".",
+                        preserved=True,
+                        retryable=False,
+                        relaunch=True,
+                        reason="이전 저장 실패로 자동발송이 중단된 상태입니다.",
+                        category="readonly",
+                        db_path=os.path.abspath(self.store.db_path),
+                        smtp_phase="before",
+                        auto_resend_blocked=True,
+                    )
+                    return self._stop_for_storage(job_id, None, blocked, "before")
                 if self.is_cancelled():
                     return self._apply_terminal_user(job_id, JOB_CANCELLED)
                 if self.is_user_stopped():
@@ -668,6 +767,8 @@ class CampaignRunner:
                     if self._complete_if_done(job_id):
                         return job_get_status_safe(self.store, job_id, self.worker_id)
                 self._heartbeat(job_id)
+        except StorageWriteError as exc:
+            return self._stop_for_storage(job_id, None, exc, exc.smtp_phase or "uncertain")
         finally:
             self._release(job_id)
 

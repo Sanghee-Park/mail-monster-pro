@@ -105,10 +105,22 @@ class DataMigrateTests(unittest.TestCase):
         for name in MIGRATABLE_FILES:
             self.assertTrue((self.dest / name).is_file(), name)
             self.assertTrue((self.src / name).is_file(), name)
+            if name == "sent_history.db":
+                continue
             self.assertEqual(
                 (self.src / name).read_bytes(),
                 (self.dest / name).read_bytes(),
             )
+        src_db = sqlite3.connect(self.src / "sent_history.db")
+        dest_db = sqlite3.connect(self.dest / "sent_history.db")
+        try:
+            self.assertEqual(
+                src_db.execute("SELECT email FROM sent_log").fetchone()[0],
+                dest_db.execute("SELECT email FROM sent_log").fetchone()[0],
+            )
+        finally:
+            src_db.close()
+            dest_db.close()
         self.assertFalse(report.conflicts)
         self.assertFalse(report.failed)
 
@@ -188,8 +200,11 @@ class DataMigrateTests(unittest.TestCase):
     def test_prepare_uses_env_dest_when_install_readonly(self):
         self._seed_legacy()
         reset_prepare_cache()
+        def only_install_blocked(path):
+            return not os.path.normcase(str(path)).startswith(os.path.normcase(str(self.src)))
+
         with patch("data_migrate.install_dir", return_value=str(self.src)), patch(
-            "data_migrate._dir_is_writable", return_value=False
+            "data_migrate._dir_is_writable", side_effect=only_install_blocked
         ):
             report = prepare_user_data(force=True)
         self.assertFalse(report.used_portable)

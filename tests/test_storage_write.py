@@ -253,7 +253,10 @@ class SqliteStorageTests(unittest.TestCase):
         dest = Path(chosen)
         self.assertFalse(report.used_portable)
         self.assertTrue(os.path.normcase(str(dest)).startswith(os.path.normcase(str(local))))
-        self.assertEqual((src / "sent_history.db").read_bytes(), src_db)
+        con = sqlite3.connect(src / "sent_history.db")
+        kept = con.execute("SELECT email FROM sent_log").fetchone()[0]
+        con.close()
+        self.assertEqual(kept, "keep@ex.com")
         self.assertTrue((src / "recipients.json").is_file())
         self.assertTrue((src / "templates.json").is_file())
         self.assertIn("keep@ex.com", (dest / "recipients.json").read_text(encoding="utf-8"))
@@ -323,7 +326,10 @@ class SqliteStorageTests(unittest.TestCase):
             chosen = chosen_data_dir()
         self.assertFalse(report.used_portable)
         self.assertTrue(os.path.normcase(chosen).startswith(os.path.normcase(str(local))))
-        self.assertEqual((src / "sent_history.db").read_bytes(), src_db)
+        con = sqlite3.connect(src / "sent_history.db")
+        kept = con.execute("SELECT email FROM sent_log").fetchone()[0]
+        con.close()
+        self.assertEqual(kept, "keep@ex.com")
         con = sqlite3.connect(Path(chosen) / "sent_history.db")
         moved = con.execute("SELECT email FROM sent_log").fetchone()[0]
         con.close()

@@ -1,7 +1,10 @@
 import customtkinter as ctk
 from tkinter import messagebox
-import sqlite3
 import os
+import sqlite3
+
+from db_access import connect
+from json_atomic import StorageWriteError
 
 
 class BlacklistManager(ctk.CTkToplevel):
@@ -137,7 +140,7 @@ class BlacklistManager(ctk.CTkToplevel):
             return
         
         try:
-            con = sqlite3.connect(self.main_ui.db_path)
+            con = connect(self.main_ui.db_path, kind="블랙리스트")
             con.execute(
                 "INSERT INTO blacklist(email, reason, added_at) VALUES(?, ?, datetime('now'))",
                 (email, reason or "")
@@ -149,6 +152,8 @@ class BlacklistManager(ctk.CTkToplevel):
             self.reason_entry.delete(0, "end")
             self._refresh_table()
             messagebox.showinfo("성공", f"{email}이 블랙리스트에 추가되었습니다.")
+        except StorageWriteError as exc:
+            messagebox.showerror("저장 오류", str(exc))
         except sqlite3.IntegrityError:
             messagebox.showerror("오류", f"{email}은 이미 블랙리스트에 있습니다.")
         except Exception as e:
@@ -165,7 +170,7 @@ class BlacklistManager(ctk.CTkToplevel):
             for item in selection:
                 values = self.tree.item(item, "values")
                 email = values[0]
-                con = sqlite3.connect(self.main_ui.db_path)
+                con = connect(self.main_ui.db_path, kind="블랙리스트")
                 con.execute("DELETE FROM blacklist WHERE email=? COLLATE NOCASE", (email,))
                 con.commit()
                 con.close()
@@ -179,7 +184,7 @@ class BlacklistManager(ctk.CTkToplevel):
         """모든 블랙리스트 항목 제거"""
         if messagebox.askyesno("확인", "정말 모든 블랙리스트 항목을 제거하시겠습니까?"):
             try:
-                con = sqlite3.connect(self.main_ui.db_path)
+                con = connect(self.main_ui.db_path, kind="블랙리스트")
                 con.execute("DELETE FROM blacklist")
                 con.commit()
                 con.close()
@@ -196,7 +201,7 @@ class BlacklistManager(ctk.CTkToplevel):
             self.tree.delete(item)
         
         try:
-            con = sqlite3.connect(self.main_ui.db_path)
+            con = connect(self.main_ui.db_path, kind="블랙리스트")
             cur = con.execute("SELECT email, reason, added_at FROM blacklist ORDER BY added_at DESC")
             rows = cur.fetchall()
             con.close()

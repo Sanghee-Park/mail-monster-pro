@@ -265,7 +265,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.8.4"
+            CURRENT_VERSION = "v2.8.5"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686")  # 기본 크기
         self.minsize(800, 520)  # 축소 시 레이아웃 붕괴·버튼 소실 방지
@@ -310,6 +310,11 @@ class ModernMailSender(ctk.CTk):
             threading.Thread(target=self._run_startup_sent_log_sync, daemon=True).start()
         self.after(400, self._recover_campaigns_if_any)
 
+    def _db_connect(self):
+        from db_access import connect
+
+        return connect(self.db_path, kind="발송 기록")
+
     def init_db(self):
         from json_atomic import clear_readonly, has_readonly_attribute
 
@@ -318,7 +323,7 @@ class ModernMailSender(ctk.CTk):
             clear_readonly(self.db_path)
         existed = os.path.isfile(self.db_path)
         try:
-            con = sqlite3.connect(self.db_path)
+            con = self._db_connect()
         except sqlite3.OperationalError as exc:
             if "readonly" in str(exc).lower():
                 raise StorageWriteError(
@@ -435,10 +440,13 @@ class ModernMailSender(ctk.CTk):
         atomic_write_json(self.recipients_file, data, indent=2, ensure_ascii=False, kind="수신처 목록")
 
     def _notify_storage_error(self, exc: StorageWriteError):
+        from db_access import format_storage_log
+
         key = self._live_task_key()
         if key:
             provider, idx = self._split_task_key(key)
-            self.write_log(provider, idx, "❌ " + str(exc).replace("\n", " "))
+            detail = format_storage_log(exc, operation=exc.kind or "저장") if exc.db_path or exc.category else "❌ " + str(exc).replace("\n", " ")
+            self.write_log(provider, idx, detail)
         parent = live_ui_parent(self)
 
         def show():
@@ -576,7 +584,7 @@ class ModernMailSender(ctk.CTk):
 
     def _count_blacklisted_rows(self, rows):
         tokens = []
-        con = sqlite3.connect(self.db_path)
+        con = self._db_connect()
         try:
             tokens = [_norm_str(r[0]) for r in con.execute("SELECT email FROM blacklist").fetchall()]
         except Exception:
@@ -686,7 +694,7 @@ class ModernMailSender(ctk.CTk):
         ch = (content_hash or "").strip() or None
         mid = (message_id or "").strip() or None
         normalized_email = e.lower()
-        con = sqlite3.connect(self.db_path)
+        con = self._db_connect()
         try:
             con.execute(
                 "INSERT INTO sent_log(task_key, provider, account_idx, comp, email, normalized_email, subject, template_name, sent_at, sender, account_id, content_hash, message_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -725,7 +733,7 @@ class ModernMailSender(ctk.CTk):
         me_name = (self.user_name or "").strip().lower()
         if not me_id and not me_name:
             return False, None, None
-        con = sqlite3.connect(self.db_path)
+        con = self._db_connect()
         try:
             cur = con.execute(
                 "SELECT sender, template_name, account_id, content_hash FROM sent_log WHERE email=? COLLATE NOCASE",
@@ -876,7 +884,7 @@ class ModernMailSender(ctk.CTk):
         if len(all_values) < 2:
             return 0
         inserted = 0
-        con = sqlite3.connect(self.db_path)
+        con = self._db_connect()
         try:
             for row in all_values[1:]:
                 if len(row) < 5:
@@ -977,7 +985,7 @@ class ModernMailSender(ctk.CTk):
         candidates = [_norm_str(x) for x in candidates_raw if _norm_str(x)]
         if not candidates:
             return False, None, None
-        con = sqlite3.connect(self.db_path)
+        con = self._db_connect()
         try:
             rows = con.execute("SELECT email, reason FROM blacklist").fetchall()
             for bl_email_raw, bl_reason in rows:
@@ -999,7 +1007,7 @@ class ModernMailSender(ctk.CTk):
         e = _norm_str(e_list[0] if e_list else e_raw)
         if not e:
             return False
-        con = sqlite3.connect(self.db_path)
+        con = self._db_connect()
         try:
             con.execute(
                 "INSERT OR IGNORE INTO blacklist(email, comp, reason, added_at) VALUES(?, ?, ?, ?)",
@@ -1019,7 +1027,7 @@ class ModernMailSender(ctk.CTk):
         e = _norm_str(e_list[0] if e_list else e_raw)
         if not e:
             return False
-        con = sqlite3.connect(self.db_path)
+        con = self._db_connect()
         try:
             con.execute(
                 "DELETE FROM blacklist WHERE LOWER(TRIM(COALESCE(email,'')))=?",
@@ -1034,7 +1042,7 @@ class ModernMailSender(ctk.CTk):
 
     def _get_blacklist(self):
         """블랙리스트 전체 조회 (Task 5-1)"""
-        con = sqlite3.connect(self.db_path)
+        con = self._db_connect()
         try:
             cur = con.execute("SELECT email, comp, reason, added_at FROM blacklist ORDER BY added_at DESC")
             return cur.fetchall()
@@ -1066,7 +1074,7 @@ class ModernMailSender(ctk.CTk):
         """오늘 발송된 건수 조회"""
         from datetime import date
         today = date.today().strftime("%Y-%m-%d")
-        con = sqlite3.connect(self.db_path)
+        con = self._db_connect()
         try:
             cur = con.execute("SELECT COUNT(*) FROM sent_log WHERE sent_at LIKE ?", (f"{today}%",))
             return cur.fetchone()[0]
@@ -1075,7 +1083,7 @@ class ModernMailSender(ctk.CTk):
 
     def _get_total_sent_count(self):
         """누적 발송 건수 조회"""
-        con = sqlite3.connect(self.db_path)
+        con = self._db_connect()
         try:
             cur = con.execute("SELECT COUNT(*) FROM sent_log")
             return cur.fetchone()[0]
@@ -1152,7 +1160,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.8.4"
+            _ver = "v2.8.5"
 
         title_lbl = ctk.CTkLabel(
             header,
@@ -3058,7 +3066,7 @@ class ModernMailSender(ctk.CTk):
         mid = str((item or {}).get("message_id") or "").strip()
         if not mid:
             return False
-        con = sqlite3.connect(self.db_path)
+        con = self._db_connect()
         try:
             row = con.execute("SELECT 1 FROM sent_log WHERE message_id=? LIMIT 1", (mid,)).fetchone()
             return row is not None
@@ -3571,8 +3579,6 @@ class ModernMailSender(ctk.CTk):
             total = job.get("total_count") or 0
             email, comp = payload.get("email"), payload.get("comp")
             if ok:
-                self.write_log(p, i, f"✅ [{idx}/{total}] {comp} <{email}> 성공")
-                self.update_last_sent_state(key, idx, comp, email)
                 actual_template = payload.get("actual_template") or ""
                 final_title = payload.get("final_title") or ""
                 body_hash = payload.get("body_hash")
@@ -3580,6 +3586,8 @@ class ModernMailSender(ctk.CTk):
                 self.record_success_to_db(
                     key, p, i, comp, email, final_title, actual_template, content_hash=body_hash, message_id=payload.get("message_id")
                 )
+                self.write_log(p, i, f"✅ [{idx}/{total}] {comp} <{email}> 성공")
+                self.update_last_sent_state(key, idx, comp, email)
                 self.after(0, lambda c=comp, em=email, t=eff_tpl: self._append_cloud_sent_row(c, em, t))
                 self._update_stats_label()
                 lbl = self.progress_labels.get(key)
@@ -3661,6 +3669,19 @@ class ModernMailSender(ctk.CTk):
         if not self.campaign_store or self._recovery_started:
             return
         self._recovery_started = True
+        from data_migrate import autosend_blocked, last_migration_report
+
+        if autosend_blocked():
+            report = last_migration_report()
+            chosen = (report.choice_note if report else "") or self.db_path
+            messagebox.showwarning(
+                "데이터 충돌",
+                "실행 폴더와 사용자 폴더에 서로 다른 발송 기록이 있습니다.\n"
+                "어느 쪽도 삭제하지 않았고, 활성 캠페인이 달라 자동발송을 시작하지 않습니다.\n\n"
+                f"사용 중인 폴더: {os.path.dirname(os.path.abspath(chosen))}",
+                parent=self,
+            )
+            return
         uid = self.login_user_id or ""
         try:
             attention = self.campaign_store.list_attention_workers(uid)
@@ -3965,11 +3986,11 @@ class ModernMailSender(ctk.CTk):
             messagebox.showerror("패키지 없음", "pandas가 설치되어 있지 않아 엑셀 내보내기를 할 수 없습니다.\n\npip install pandas openpyxl")
             return
 
-        con = sqlite3.connect(self.db_path)
+        con = self._db_connect()
         try:
             df = pd.read_sql_query(
                 "SELECT id, provider, account_idx as account, comp, email, subject, template_name, content_hash, sent_at FROM sent_log WHERE task_key=? ORDER BY sent_at DESC",
-                con,
+                con.raw,
                 params=(task_key,)
             )
         finally:
@@ -4039,7 +4060,7 @@ class ModernMailSender(ctk.CTk):
                 if not email:
                     continue
                 to_insert.append((email, comp, "시트 동기화", now))
-            con = sqlite3.connect(self.db_path)
+            con = self._db_connect()
             try:
                 con.execute("DELETE FROM blacklist")
                 con.executemany(

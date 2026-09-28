@@ -48,6 +48,8 @@ class MigrationReport:
     conflicts: List[str] = field(default_factory=list)
     failed: List[Tuple[str, str]] = field(default_factory=list)
     already_migrated: bool = False
+    block_autosend: bool = False
+    choice_note: str = ""
 
     @property
     def has_user_notice(self) -> bool:
@@ -160,11 +162,10 @@ def migrate_legacy_data_files(
         report.already_migrated = True
     do_copy = copy_fn or copy_file_atomic
     extra = list(names)
-    if "sent_history.db" in extra:
-        extra = list(extra) + [s for s in SQLITE_SIDECARS if s not in extra]
-
     copied = list(previously)
     for name in extra:
+        if name in SQLITE_SIDECARS:
+            continue
         src_path = os.path.join(src, name)
         dest_path = os.path.join(dest, name)
         if not os.path.isfile(src_path):
@@ -175,7 +176,12 @@ def migrate_legacy_data_files(
                 report.conflicts.append(name)
             continue
         try:
-            do_copy(src_path, dest_path)
+            if name == "sent_history.db" and copy_fn is None:
+                from db_access import backup_database
+
+                backup_database(src_path, dest_path)
+            else:
+                do_copy(src_path, dest_path)
             report.migrated.append(name)
             if name not in copied:
                 copied.append(name)
@@ -227,9 +233,11 @@ def directory_supports_replace_and_wal(directory: str) -> bool:
         if '"probe": 2' not in replaced and '"probe":2' not in replaced:
             return False
         _remove_probe_files(db_path)
-        con = sqlite3.connect(db_path, timeout=5)
+        from db_access import connect as connect_database
+        from json_atomic import StorageWriteError
+
+        con = connect_database(db_path, kind="저장 위치 검사")
         try:
-            con.execute("PRAGMA journal_mode=WAL")
             con.execute("PRAGMA wal_autocheckpoint=0")
             con.execute("BEGIN IMMEDIATE")
             con.execute("CREATE TABLE probe(id INTEGER)")
@@ -240,6 +248,8 @@ def directory_supports_replace_and_wal(directory: str) -> bool:
                 return False
             if not (os.path.isfile(db_path + "-wal") or os.path.isfile(db_path + "-shm")):
                 return False
+        except StorageWriteError:
+            return False
         finally:
             con.close()
         return True
@@ -263,19 +273,26 @@ def existing_state_is_writable(directory: str) -> bool:
         if not clear_readonly(path) or not file_allows_write(path):
             return False
         if name == "sent_history.db":
+            from db_access import connect as connect_database
+            from json_atomic import StorageWriteError
+
             try:
-                con = sqlite3.connect(path, timeout=5)
+                con = connect_database(path, kind="발송 기록")
                 try:
                     con.execute("BEGIN IMMEDIATE")
-                    con.commit()
-                    mode = con.execute("PRAGMA journal_mode=WAL").fetchone()
+                    con.rollback()
+                    mode = con.execute("PRAGMA journal_mode").fetchone()
                     if not mode or str(mode[0]).lower() != "wal":
                         return False
                 finally:
                     con.close()
-            except sqlite3.OperationalError as exc:
+            except StorageWriteError as exc:
+                if exc.category in ("locked", "busy"):
+                    return True
+                return False
+            except sqlite3.DatabaseError as exc:
                 text = str(exc).lower()
-                if "locked" in text or "busy" in text:
+                if "not a database" in text or "no such table" in text:
                     return True
                 return False
             except sqlite3.Error:
@@ -296,52 +313,178 @@ def _backup_then_copy(src: str, dest: str) -> None:
     copy_file_atomic(src, dest)
 
 
+class StorageUnavailable(Exception):
+    """실행 폴더와 LocalAppData 를 모두 쓸 수 없을 때."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 def chosen_data_dir() -> str:
     override = (os.environ.get(DATA_DIR_ENV) or "").strip()
+    global _CHOSEN_DIR
     if override:
         path = os.path.abspath(override)
-        os.makedirs(path, exist_ok=True)
-        return path
-    global _CHOSEN_DIR
-    if _CHOSEN_DIR:
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            path = ""
+        if path and storage_root_is_safe(path):
+            _CHOSEN_DIR = path
+            return path
+    elif _CHOSEN_DIR:
         return _CHOSEN_DIR
     prepare_user_data()
-    return _CHOSEN_DIR or os.path.abspath(install_dir())
+    if not _CHOSEN_DIR:
+        raise StorageUnavailable("저장 위치를 정하지 못했습니다.")
+    return _CHOSEN_DIR
+
+
+def autosend_blocked() -> bool:
+    report = _LAST_REPORT
+    return bool(report and report.block_autosend)
+
+
+def _active_campaign_keys(db_path: str) -> set:
+    if not os.path.isfile(db_path):
+        return set()
+    from db_access import connect as connect_database
+    from json_atomic import StorageWriteError
+
+    try:
+        con = connect_database(db_path, kind="발송 기록")
+        try:
+            rows = con.execute(
+                """
+                SELECT job_id, login_user_id, task_key, status
+                FROM campaign_jobs
+                WHERE status IN ('queued','running','scheduled_pause','needs_attention','user_stopped')
+                """
+            ).fetchall()
+            return {tuple(row) for row in rows}
+        finally:
+            con.close()
+    except (StorageWriteError, sqlite3.Error):
+        return {("unreadable", os.path.abspath(db_path))}
+
+
+def _backup_live_db(path: str) -> None:
+    if not os.path.isfile(path):
+        return
+    from db_access import backup_database
+
+    folder = os.path.join(os.path.dirname(path), "mm-backup")
+    os.makedirs(folder, exist_ok=True)
+    dest = os.path.join(folder, f"sent_history.db.{time.strftime('%Y%m%d%H%M%S')}")
+    backup_database(path, dest)
+
+
+def _note_split_databases(primary: str, secondary: str, report: MigrationReport) -> None:
+    """두 폴더의 DB가 다르면 각각 백업하고, 활성 캠페인이 다르면 자동발송을 막는다."""
+    primary_db = os.path.join(primary, "sent_history.db")
+    secondary_db = os.path.join(secondary, "sent_history.db")
+    if not (os.path.isfile(primary_db) and os.path.isfile(secondary_db)):
+        return
+    if os.path.normcase(os.path.abspath(primary_db)) == os.path.normcase(os.path.abspath(secondary_db)):
+        return
+    try:
+        with open(primary_db, "rb") as left, open(secondary_db, "rb") as right:
+            same = left.read() == right.read()
+    except OSError:
+        same = False
+    if same:
+        return
+    try:
+        _backup_live_db(primary_db)
+        _backup_live_db(secondary_db)
+    except Exception:
+        report.failed.append(("sent_history.db", "BackupFailed"))
+    left = _active_campaign_keys(primary_db)
+    right = _active_campaign_keys(secondary_db)
+    if left != right:
+        report.block_autosend = True
+    report.choice_note = primary
+    report.conflicts.append("sent_history.db")
+    try:
+        from json_atomic import atomic_write_json
+
+        atomic_write_json(
+            os.path.join(primary, "storage_choice.json"),
+            {
+                "chosen": primary,
+                "other": secondary,
+                "block_autosend": report.block_autosend,
+            },
+            indent=2,
+            ensure_ascii=False,
+            kind="저장 위치 기록",
+        )
+    except Exception:
+        pass
 
 
 def prepare_user_data(*, force: bool = False) -> MigrationReport:
-    """저장 위치를 프로세스당 한 번 정한다. 안전하지 않으면 LocalAppData로 복사한다."""
+    """단일 인스턴스 잠금 뒤에 호출한다. 안전한 폴더 하나만 확정한다."""
     global _PREPARED, _LAST_REPORT, _CHOSEN_DIR
     if _PREPARED and not force:
         return _LAST_REPORT or MigrationReport(used_portable=True)
     inst = os.path.abspath(install_dir())
     env_dest = (os.environ.get(DATA_DIR_ENV) or "").strip()
+    env_path = ""
     if env_dest:
-        dest = appdata_target_dir()
-        _CHOSEN_DIR = dest
-        if os.path.normcase(inst) == os.path.normcase(dest) or storage_root_is_safe(inst):
-            _LAST_REPORT = MigrationReport(used_portable=True, source_dir=inst, dest_dir=dest)
+        try:
+            env_path = os.path.abspath(env_dest)
+            os.makedirs(env_path, exist_ok=True)
+        except OSError:
+            env_path = ""
+    if env_path and storage_root_is_safe(env_path):
+        _CHOSEN_DIR = env_path
+        if os.path.normcase(inst) == os.path.normcase(env_path) or storage_root_is_safe(inst):
+            report = MigrationReport(used_portable=True, source_dir=inst, dest_dir=env_path)
         else:
-            _LAST_REPORT = migrate_legacy_data_files(
-                inst, dest, source_writable=False, copy_fn=_backup_then_copy
-            )
+            report = migrate_legacy_data_files(inst, env_path, source_writable=False, copy_fn=_backup_then_copy)
+        _note_split_databases(env_path, inst, report)
+        _LAST_REPORT = report
         _PREPARED = True
-        return _LAST_REPORT
+        return report
     if storage_root_is_safe(inst):
         _CHOSEN_DIR = inst
-        _LAST_REPORT = MigrationReport(used_portable=True, source_dir=inst, dest_dir=inst)
+        report = MigrationReport(used_portable=True, source_dir=inst, dest_dir=inst)
+        local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or ""
+        if local:
+            other = os.path.join(local, APP_DATA_FOLDER)
+            _note_split_databases(inst, other, report)
+        _LAST_REPORT = report
         _PREPARED = True
-        return _LAST_REPORT
+        return report
     dest = appdata_target_dir()
+    if not storage_root_is_safe(dest):
+        _CHOSEN_DIR = None
+        _PREPARED = True
+        _LAST_REPORT = MigrationReport(source_dir=inst, dest_dir=dest)
+        raise StorageUnavailable(
+            "발송 기록을 저장할 폴더를 만들지 못해 프로그램을 시작하지 않습니다.\n\n"
+            f"실행 폴더: {inst}\n"
+            f"사용자 폴더: {dest}\n"
+            "두 위치 모두 데이터베이스 쓰기가 되지 않습니다. 기존 파일은 삭제하지 않았습니다."
+        )
     report = migrate_legacy_data_files(inst, dest, source_writable=False, copy_fn=_backup_then_copy)
-    if storage_root_is_safe(dest):
-        _CHOSEN_DIR = dest
-    else:
-        _CHOSEN_DIR = inst
-        report.failed.append(("storage-root", "UnsafeDestination"))
+    if not storage_root_is_safe(dest):
+        _CHOSEN_DIR = None
+        _PREPARED = True
+        _LAST_REPORT = report
+        raise StorageUnavailable(
+            "사용자 폴더로 데이터를 옮긴 뒤에도 쓰기를 확인하지 못했습니다.\n\n"
+            f"실행 폴더: {inst}\n"
+            f"사용자 폴더: {dest}\n"
+            "기존 파일은 삭제하지 않았습니다."
+        )
+    _CHOSEN_DIR = dest
+    _note_split_databases(dest, inst, report)
     _LAST_REPORT = report
     _PREPARED = True
-    return _LAST_REPORT
+    return report
 
 
 def format_migration_user_message(report: Optional[MigrationReport]) -> str:

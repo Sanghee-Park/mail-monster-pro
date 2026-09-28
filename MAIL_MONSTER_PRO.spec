@@ -43,6 +43,7 @@ hiddenimports = [
     'campaign_ui_state',
     'template_prefs',
     'json_atomic',
+    'db_access',
     'app_paths',
     'version_compare',
     'smtp_credentials',

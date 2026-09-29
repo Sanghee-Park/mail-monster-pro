@@ -33,6 +33,27 @@ def missing_attachment_paths(attachments: Optional[dict]) -> List[str]:
     return missing
 
 
+def missing_attention_code(attachments: Optional[dict], missing: List[str]) -> str:
+    data = attachments if isinstance(attachments, dict) else {}
+    imgs = data.get("imgs") if isinstance(data.get("imgs"), dict) else {}
+
+    def norm(path) -> str:
+        text = str(path or "").strip()
+        if not text:
+            return ""
+        try:
+            return os.path.normcase(os.path.abspath(text))
+        except OSError:
+            return text
+
+    files = {norm(path) for path in (data.get("files") or []) if norm(path)}
+    cids = {norm(path) for path in imgs.values() if norm(path)}
+    gone = {norm(path) for path in missing if norm(path)}
+    if gone & cids and not (gone & files):
+        return "missing_cid"
+    return "missing_attachment"
+
+
 def format_missing_files_reason(missing: List[str]) -> str:
     if not missing:
         return ""

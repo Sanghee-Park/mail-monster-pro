@@ -7,7 +7,7 @@ import uuid
 from typing import Callable, Optional, Tuple
 
 from business_hours import BusinessHours, as_kst
-from campaign_attachments import format_missing_files_reason, missing_attachment_paths
+from campaign_attachments import format_missing_files_reason, missing_attachment_paths, missing_attention_code
 from db_access import (
     append_recovery_journal,
     assert_immediate_write,
@@ -89,6 +89,7 @@ class CampaignRunner:
         interval_seconds_fn: Callable[[], int],
         now_fn=None,
         sleep_fn=None,
+        monotonic_fn=None,
         on_log=None,
         on_progress=None,
         max_retries: int = 3,
@@ -107,6 +108,7 @@ class CampaignRunner:
         self.interval_seconds_fn = interval_seconds_fn
         self.now_fn = now_fn or hours.now
         self.sleep_fn = sleep_fn or time.sleep
+        self.monotonic_fn = monotonic_fn or time.monotonic
         self.on_log = on_log or (lambda m: None)
         self.on_progress = on_progress or (lambda stats: None)
         self.max_retries = max_retries
@@ -125,8 +127,42 @@ class CampaignRunner:
             return None
         return self.store.get_worker(self.worker_id)
 
-    def _progress(self, job_id: str) -> None:
+    def _progress(self, job_id: str, *, force: bool = False) -> None:
+        now_m = self.monotonic_fn()
+        if not force and now_m - getattr(self, "_progress_at", 0) < 0.4:
+            return
+        self._progress_at = now_m
         self.on_progress(self.store.stats_dict(job_id, worker_id=self.worker_id))
+
+    def _wait_before_real_smtp(self, job_id: str) -> Optional[str]:
+        """실제 SMTP 호출 간격만 맞춘다. 로컬 스킵은 이 함수를 타지 않는다."""
+        total = max(0, int(self.interval_seconds_fn() or 0))
+        last = getattr(self, "_last_smtp_at", None)
+        if total <= 0 or last is None:
+            return None
+        elapsed = int(self.monotonic_fn() - last)
+        remain = total - elapsed
+        for _ in range(max(0, remain)):
+            job = self.store.get_job(job_id) or {}
+            reason = evaluate_send_gate(
+                job=job,
+                item={"id": None, "status": ITEM_PENDING},
+                hours=self.hours,
+                is_user_stopped=self.is_user_stopped,
+                is_cancelled=self.is_cancelled,
+                now=self.now(),
+                worker=self._worker(),
+            )
+            if reason == JOB_USER_STOPPED:
+                return self._apply_terminal_user(job_id, JOB_USER_STOPPED)
+            if reason == JOB_CANCELLED:
+                return self._apply_terminal_user(job_id, JOB_CANCELLED)
+            if reason == JOB_SCHEDULED_PAUSE:
+                return self._pause_scheduled(job_id)
+            if reason == JOB_NEEDS_ATTENTION:
+                return JOB_NEEDS_ATTENTION
+            self.sleep_fn(1)
+        return None
 
     def _gate(self, job_id: str, item: dict) -> Optional[str]:
         job = self.store.get_job(job_id) or {}
@@ -168,29 +204,42 @@ class CampaignRunner:
         if phase in ("after", "uncertain"):
             exc.smtp_phase = phase
         try:
-            append_recovery_journal(
-                {
-                    "job_id": job_id,
-                    "item_id": (item or {}).get("id"),
-                    "task_key": (item or {}).get("task_key") or (item or {}).get("claimed_by_task_key") or "",
-                    "message_id": (item or {}).get("message_id") or "",
-                    "at": self.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "needs_review",
-                    "smtp_phase": phase,
-                }
-            )
+                if phase == "before":
+                    journal_status = "pending"
+                else:
+                    journal_status = "needs_review"
+                append_recovery_journal(
+                    {
+                        "job_id": job_id,
+                        "item_id": (item or {}).get("id"),
+                        "task_key": (item or {}).get("task_key") or (item or {}).get("claimed_by_task_key") or "",
+                        "message_id": (item or {}).get("message_id") or "",
+                        "at": self.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "status": journal_status,
+                        "smtp_phase": phase,
+                    }
+                )
         except Exception:
             pass
         if item and item.get("id") is not None:
             try:
-                self.store.mark_item(
-                    item["id"],
-                    ITEM_NEEDS_REVIEW,
-                    error_message="SMTP 접수 여부가 확인되지 않아 자동 재발송하지 않습니다.",
-                    now=self.now(),
-                )
+                if phase == "before":
+                    self.store.mark_item(
+                        item["id"],
+                        ITEM_PENDING,
+                        error_message="저장 실패로 발송 전에 중단했습니다.",
+                        now=self.now(),
+                    )
+                else:
+                    self.store.mark_item(
+                        item["id"],
+                        ITEM_NEEDS_REVIEW,
+                        error_message="SMTP 접수 여부가 확인되지 않아 자동 재발송하지 않습니다.",
+                        now=self.now(),
+                    )
             except Exception:
                 pass
+        code = "storage_before_smtp" if phase == "before" else "delivery_uncertain"
         shown = exc
         if phase in ("after", "uncertain"):
             shown = StorageWriteError(
@@ -207,22 +256,24 @@ class CampaignRunner:
         self.on_log(format_storage_log(shown, operation="발송 기록"))
         text = str(shown)
         try:
-            return self._halt_worker(job_id, text)
+            return self._halt_worker(job_id, text, attention_code=code)
         except Exception:
             self.on_log(text)
             return JOB_NEEDS_ATTENTION
 
-    def _halt_worker(self, job_id: str, reason: str) -> str:
+    def _halt_worker(self, job_id: str, reason: str, attention_code: str = "") -> str:
         if self.worker_id:
-            self.store.set_needs_attention_worker(self.worker_id, reason, now=self.now())
+            self.store.set_needs_attention_worker(
+                self.worker_id, reason, now=self.now(), attention_code=attention_code
+            )
         else:
-            self.store.set_needs_attention(job_id, reason, now=self.now())
+            self.store.set_needs_attention(job_id, reason, now=self.now(), attention_code=attention_code)
         self.on_log(reason)
         self._progress(job_id)
         return JOB_NEEDS_ATTENTION
 
-    def _halt_campaign(self, job_id: str, reason: str) -> str:
-        self.store.set_needs_attention(job_id, reason, now=self.now())
+    def _halt_campaign(self, job_id: str, reason: str, attention_code: str = "") -> str:
+        self.store.set_needs_attention(job_id, reason, now=self.now(), attention_code=attention_code)
         for w in self.store.list_workers(job_id):
             if w.get("status") in (JOB_RUNNING, JOB_QUEUED, JOB_SCHEDULED_PAUSE):
                 self.store.set_worker_status(
@@ -231,6 +282,7 @@ class CampaignRunner:
                     now=self.now(),
                     clear_runner=True,
                     attention_reason=reason,
+                    attention_code=attention_code or None,
                     sync_job=False,
                 )
         self.on_log(reason)
@@ -305,6 +357,7 @@ class CampaignRunner:
             self._halt_campaign(
                 job_id,
                 f"발송 결과를 확정할 수 없는 수신자가 {review}건 있어 자동 재발송하지 않습니다.",
+                attention_code="delivery_uncertain",
             )
             return True
         self.store.set_status(job_id, JOB_COMPLETED, now=self.now(), clear_runner=True)
@@ -320,7 +373,11 @@ class CampaignRunner:
         attach = self.attachments_from_job(job)
         missing = missing_attachment_paths(attach)
         if missing:
-            return self._halt_campaign(job_id, format_missing_files_reason(missing))
+            return self._halt_campaign(
+                job_id,
+                format_missing_files_reason(missing),
+                attention_code=missing_attention_code(attach, missing),
+            )
         return None
 
     def _bump(self, kind: str) -> None:
@@ -378,7 +435,7 @@ class CampaignRunner:
             self._bump("skipped")
             self.store.refresh_counts(job_id)
             self._progress(job_id)
-            return None
+            return "local_skip"
         if kind == "halt":
             self.store.mark_item(item["id"], ITEM_PENDING, error_message=str(payload or ""))
             return self._halt_worker(job_id, str(payload or "사용자 확인이 필요합니다."))
@@ -412,7 +469,7 @@ class CampaignRunner:
             self._bump("skipped")
             self.store.refresh_counts(job_id)
             self._progress(job_id)
-            return None
+            return "local_skip"
 
         reservation_id = ""
         if bool(job.get("prevent_dup")) and isinstance(payload, dict):
@@ -479,7 +536,7 @@ class CampaignRunner:
                 self._bump("skipped")
                 self.store.refresh_counts(job_id)
                 self._progress(job_id)
-                return None
+                return "local_skip"
 
             try:
                 if writes_blocked():
@@ -499,6 +556,16 @@ class CampaignRunner:
             except StorageWriteError as exc:
                 return self._stop_for_storage(job_id, item, exc, "before")
 
+            paused = self._wait_before_real_smtp(job_id)
+            if paused:
+                if int(item.get("attempts") or 0) <= 0:
+                    try:
+                        self.store.mark_item(item["id"], ITEM_PENDING, now=self.now())
+                    except Exception:
+                        pass
+                return paused
+
+            self._last_smtp_at = self.monotonic_fn()
             self.smtp_calls += 1
             try:
                 ok, err = self.send_once_fn(payload, job, live)
@@ -536,6 +603,7 @@ class CampaignRunner:
                 return self._halt_worker(
                     job_id,
                     "SMTP 자격증명을 확인할 수 없어 발송을 중단했습니다. 계정 설정에서 비밀번호를 확인하세요.",
+                    attention_code="missing_credentials",
                 )
             if attempts_done < self.max_retries:
                 for _ in range(min(2 ** attempts_done, 8)):
@@ -577,6 +645,7 @@ class CampaignRunner:
             return self._halt_worker(
                 job_id,
                 "SMTP 접수 여부가 불명확한 항목이 있어 자동 재발송하지 않습니다.",
+                attention_code="delivery_uncertain",
             )
         self.store.mark_item(item["id"], ITEM_FAILED, error_message=last_err, now=self.now())
         self.store.set_reservation_status(
@@ -608,6 +677,11 @@ class CampaignRunner:
             self.store.release_job(job_id, self.owner)
 
     def run(self, job_id: str, *, wait_off_hours: bool = True) -> str:
+        from data_migrate import autosend_blocked
+
+        if autosend_blocked():
+            self.on_log("발송 기록을 선택하기 전에는 메일을 보내지 않습니다.")
+            return "storage_choice"
         job = self.store.get_job(job_id)
         if not job:
             return "missing"
@@ -624,7 +698,10 @@ class CampaignRunner:
             self.on_log("다른 실행 인스턴스가 이미 이 작업을 발송 중입니다.")
             return "locked"
 
-        rec = self.store.reconcile_interrupted_sending(job_id, self.sent_lookup_fn, now=self.now())
+        try:
+            rec = self.store.reconcile_interrupted_sending(job_id, self.sent_lookup_fn, now=self.now())
+        except StorageWriteError as exc:
+            return self._stop_for_storage(job_id, None, exc, "before")
         job = self.store.get_job(job_id) or job
         worker = self._worker() or worker
         if worker and worker.get("status") == JOB_NEEDS_ATTENTION:
@@ -734,21 +811,6 @@ class CampaignRunner:
 
                 remaining_before = self.store.remaining_count(job_id) + 1
 
-                if need_wait_before_smtp:
-                    paused = self._wait_interval(job_id)
-                    if paused:
-                        if int(item.get("attempts") or 0) <= 0:
-                            self.store.mark_item(item["id"], ITEM_PENDING)
-                        if paused == JOB_SCHEDULED_PAUSE and wait_off_hours:
-                            resumed = self.wait_for_send_window(job_id)
-                            if resumed != JOB_RUNNING:
-                                return resumed
-                            if not self._claim_or_lock(job_id):
-                                return "locked"
-                            need_wait_before_smtp = True
-                            continue
-                        return paused
-
                 result = self.process_one(job_id, item)
                 if result in (JOB_USER_STOPPED, JOB_CANCELLED, JOB_NEEDS_ATTENTION):
                     return result
@@ -762,7 +824,7 @@ class CampaignRunner:
                         return "locked"
                     continue
                 if result == "did_smtp":
-                    need_wait_before_smtp = True
+                    pass
                 if remaining_before <= 1 or self.store.remaining_count(job_id) == 0:
                     if self._complete_if_done(job_id):
                         return job_get_status_safe(self.store, job_id, self.worker_id)

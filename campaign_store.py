@@ -188,6 +188,7 @@ def ensure_campaign_schema(con: sqlite3.Connection) -> None:
         "next_resume_at": "TEXT",
         "login_user_id": "TEXT NOT NULL DEFAULT ''",
         "attention_reason": "TEXT",
+        "attention_code": "TEXT",
         "generation": "INTEGER NOT NULL DEFAULT 1",
         "legacy_pool": "INTEGER NOT NULL DEFAULT 0",
         "migration_state": "TEXT",
@@ -268,6 +269,7 @@ def ensure_campaign_schema(con: sqlite3.Connection) -> None:
         "runner_id": "TEXT",
         "lease_until": "TEXT",
         "attention_reason": "TEXT",
+        "attention_code": "TEXT",
         "success_count": "INTEGER DEFAULT 0",
         "skipped_count": "INTEGER DEFAULT 0",
         "failed_count": "INTEGER DEFAULT 0",
@@ -537,7 +539,7 @@ class CampaignStore:
             pass
 
     def restore_recovery_journal(self) -> int:
-        """복구 저널의 항목은 pending 으로 되돌리지 않고 확인 필요 상태로 둔다."""
+        """SMTP 전 실패는 pending, SMTP 후 불확실 항목은 needs_review 로 복원한다."""
         restored = 0
         for row in load_recovery_journal():
             if row.get("status") == "restored":
@@ -548,6 +550,13 @@ class CampaignStore:
                 continue
             item = self.get_item(item_id)
             if not item:
+                continue
+            phase = row.get("smtp_phase") or ""
+            if phase == "before":
+                if item.get("status") == ITEM_SENDING:
+                    self.mark_item(item_id, ITEM_PENDING, error_message="저장 실패로 발송 전에 중단했습니다.")
+                restored += 1
+                mark_journal_applied(item_id)
                 continue
             if item.get("status") in (ITEM_PENDING, ITEM_SENDING):
                 self.mark_item(
@@ -562,6 +571,7 @@ class CampaignStore:
                         self.set_needs_attention(
                             job_id,
                             "발송 기록을 저장할 수 없어 자동발송을 안전하게 중단했습니다. 확인 전에 다시 보내지 않습니다.",
+                            attention_code="delivery_uncertain",
                         )
                 restored += 1
             mark_journal_applied(item_id)
@@ -1289,6 +1299,7 @@ class CampaignStore:
         now: Optional[datetime] = None,
         clear_runner: bool = False,
         attention_reason: Optional[str] = None,
+        attention_code: Optional[str] = None,
         sync_job: bool = True,
     ) -> None:
         fields: Dict[str, Any] = {"status": status, "updated_at": _now_iso(now)}
@@ -1300,6 +1311,10 @@ class CampaignStore:
             fields["attention_reason"] = attention_reason
         elif status not in (JOB_NEEDS_ATTENTION,):
             fields["attention_reason"] = None
+        if attention_code is not None:
+            fields["attention_code"] = attention_code
+        elif status not in (JOB_NEEDS_ATTENTION,):
+            fields["attention_code"] = None
         if clear_runner or status in (
             JOB_COMPLETED,
             JOB_CANCELLED,
@@ -1316,14 +1331,30 @@ class CampaignStore:
             if jid:
                 self.sync_job_status_from_workers(jid, now=now)
 
-    def set_needs_attention_worker(self, worker_id: str, reason: str, *, now: Optional[datetime] = None) -> None:
+    def set_needs_attention_worker(
+        self,
+        worker_id: str,
+        reason: str,
+        *,
+        now: Optional[datetime] = None,
+        attention_code: str = "",
+    ) -> None:
         self.set_worker_status(
             worker_id,
             JOB_NEEDS_ATTENTION,
             now=now,
             clear_runner=True,
             attention_reason=reason or "사용자 확인이 필요합니다.",
+            attention_code=attention_code or None,
         )
+        worker = self.get_worker(worker_id) or {}
+        if worker.get("job_id"):
+            self.set_needs_attention(
+                worker["job_id"],
+                reason,
+                now=now,
+                attention_code=attention_code,
+            )
 
     def pause_workers_scheduled(self, job_id: str, *, next_resume_at: str, now: Optional[datetime] = None) -> None:
         for w in self.list_workers(job_id):
@@ -1612,6 +1643,7 @@ class CampaignStore:
         now: Optional[datetime] = None,
         clear_runner: bool = False,
         attention_reason: Optional[str] = None,
+        attention_code: Optional[str] = None,
     ) -> None:
         fields: Dict[str, Any] = {"status": status, "updated_at": _now_iso(now)}
         if status in (JOB_COMPLETED, JOB_CANCELLED):
@@ -1630,6 +1662,10 @@ class CampaignStore:
             fields["attention_reason"] = attention_reason
         elif status not in (JOB_NEEDS_ATTENTION,):
             fields["attention_reason"] = None
+        if attention_code is not None:
+            fields["attention_code"] = attention_code
+        elif status not in (JOB_NEEDS_ATTENTION,):
+            fields["attention_code"] = None
         if clear_runner or status in (
             JOB_COMPLETED,
             JOB_CANCELLED,
@@ -1641,13 +1677,21 @@ class CampaignStore:
             fields["lease_until"] = None
         self.update_job(job_id, **fields)
 
-    def set_needs_attention(self, job_id: str, reason: str, *, now: Optional[datetime] = None) -> None:
+    def set_needs_attention(
+        self,
+        job_id: str,
+        reason: str,
+        *,
+        now: Optional[datetime] = None,
+        attention_code: str = "",
+    ) -> None:
         self.set_status(
             job_id,
             JOB_NEEDS_ATTENTION,
             now=now,
             clear_runner=True,
             attention_reason=reason or "사용자 확인이 필요합니다.",
+            attention_code=attention_code or None,
         )
 
     def update_attachments(self, job_id: str, attachments: dict) -> None:

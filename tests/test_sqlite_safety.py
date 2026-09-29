@@ -87,6 +87,7 @@ class SqliteSafetyTests(unittest.TestCase):
         self._old_mutex = os.environ.get("MAILMONSTER_MUTEX_NAME")
         os.environ[DATA_DIR_ENV] = str(self.root / "data")
         os.environ["LOCALAPPDATA"] = str(self.root / "local")
+        os.environ["MAILMONSTER_SCAN_CLOUD"] = "0"
         reset_write_block()
         reset_prepare_cache()
 
@@ -251,7 +252,7 @@ class SqliteSafetyTests(unittest.TestCase):
         self.assertEqual(runner.smtp_calls, 0)
         self.assertEqual(result, "needs_attention")
         item = _only_item(store, job["job_id"])
-        self.assertNotEqual(item["status"], ITEM_PENDING)
+        self.assertEqual(item["status"], ITEM_PENDING)
 
     def test_smtp_success_then_db_failure_does_not_resend(self):
         os.environ[DATA_DIR_ENV] = str(self.root)
@@ -336,11 +337,10 @@ class SqliteSafetyTests(unittest.TestCase):
         os.environ[DATA_DIR_ENV] = str(bad)
         reset_prepare_cache()
         with patch("data_migrate.install_dir", return_value=str(good)):
-            report = prepare_user_data(force=True)
-        from data_migrate import chosen_data_dir
-
-        self.assertNotEqual(os.path.normcase(chosen_data_dir()), os.path.normcase(str(bad)))
-        self.assertTrue(report.used_portable)
+            with self.assertRaises(StorageUnavailable) as caught:
+                prepare_user_data(force=True)
+        self.assertIn("MAILMONSTER_DATA_DIR", str(caught.exception))
+        self.assertTrue(good.is_dir())
 
         reset_prepare_cache()
         os.environ.pop(DATA_DIR_ENV, None)

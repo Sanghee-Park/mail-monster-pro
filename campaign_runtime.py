@@ -89,6 +89,7 @@ class CampaignRunner:
         interval_seconds_fn: Callable[[], int],
         now_fn=None,
         sleep_fn=None,
+        monotonic_fn=None,
         on_log=None,
         on_progress=None,
         max_retries: int = 3,
@@ -107,6 +108,7 @@ class CampaignRunner:
         self.interval_seconds_fn = interval_seconds_fn
         self.now_fn = now_fn or hours.now
         self.sleep_fn = sleep_fn or time.sleep
+        self.monotonic_fn = monotonic_fn or time.monotonic
         self.on_log = on_log or (lambda m: None)
         self.on_progress = on_progress or (lambda stats: None)
         self.max_retries = max_retries
@@ -126,7 +128,7 @@ class CampaignRunner:
         return self.store.get_worker(self.worker_id)
 
     def _progress(self, job_id: str, *, force: bool = False) -> None:
-        now_m = time.monotonic()
+        now_m = self.monotonic_fn()
         if not force and now_m - getattr(self, "_progress_at", 0) < 0.4:
             return
         self._progress_at = now_m
@@ -138,7 +140,7 @@ class CampaignRunner:
         last = getattr(self, "_last_smtp_at", None)
         if total <= 0 or last is None:
             return None
-        elapsed = int(time.monotonic() - last)
+        elapsed = int(self.monotonic_fn() - last)
         remain = total - elapsed
         for _ in range(max(0, remain)):
             job = self.store.get_job(job_id) or {}
@@ -563,7 +565,7 @@ class CampaignRunner:
                         pass
                 return paused
 
-            self._last_smtp_at = time.monotonic()
+            self._last_smtp_at = self.monotonic_fn()
             self.smtp_calls += 1
             try:
                 ok, err = self.send_once_fn(payload, job, live)

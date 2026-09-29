@@ -162,6 +162,7 @@ class V286Tests(unittest.TestCase):
             interval_seconds_fn=lambda: interval,
             now_fn=lambda: clock["v"],
             sleep_fn=sleep_fn,
+            monotonic_fn=lambda: clock["v"].timestamp(),
             owner="owner",
             worker_id=job.get("worker_id"),
             max_retries=1,

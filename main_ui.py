@@ -86,7 +86,6 @@ BLACKLIST_SHEET_KEY = "1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw"
 BLACKLIST_SHEET_KEY = "1I5cdNtpJYQuzYt0juhOcgbcltTv7wb3BJFI2AnI2Crw"
 
 BASE_DIR = install_dir()
-STATE_FILES = resolve_state_files()
 
 
 # Phase 4: 계정별 로그 박스 무한 누적 방지 (발송 로직과 무관)
@@ -265,7 +264,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION
         except ImportError:
-            CURRENT_VERSION = "v2.8.5"
+            CURRENT_VERSION = "v2.8.6"
         self.title(f"MAIL MONSTER PRO {CURRENT_VERSION}")
         self.geometry("980x686")  # 기본 크기
         self.minsize(800, 520)  # 축소 시 레이아웃 붕괴·버튼 소실 방지
@@ -1160,7 +1159,7 @@ class ModernMailSender(ctk.CTk):
         try:
             from login import CURRENT_VERSION as _ver
         except ImportError:
-            _ver = "v2.8.5"
+            _ver = "v2.8.6"
 
         title_lbl = ctk.CTkLabel(
             header,
@@ -1223,7 +1222,16 @@ class ModernMailSender(ctk.CTk):
             fg_color="#8e44ad",
             command=self._open_user_profile_popup,
         ).pack(side="left", padx=(0, 6))
-        
+        from app_paths import user_data_dir
+
+        ctk.CTkLabel(
+            header,
+            text="데이터 폴더: " + user_data_dir(),
+            font=self._font_small,
+            anchor="w",
+            text_color="#aab7c4",
+        ).grid(row=2, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 6))
+
         # 테이블 공통 스타일 (가독성)
         style = ttk.Style()
         style.configure("Treeview", font=("맑은 고딕", 11), rowheight=24)
@@ -3102,7 +3110,9 @@ class ModernMailSender(ctk.CTk):
         live = resolve_smtp_for_send(self.config_file, key, self.campaign_store.job_smtp_config(job))
         if not live:
             self.campaign_store.set_needs_attention(
-                job_id, "SMTP 계정 자격증명을 찾을 수 없습니다. 계정 설정에서 비밀번호를 확인하세요."
+                job_id,
+                "SMTP 계정 자격증명을 찾을 수 없습니다. 계정 설정에서 비밀번호를 확인하세요.",
+                attention_code="missing_credentials",
             )
             return JOB_NEEDS_ATTENTION
         return maybe_release_attention(
@@ -3159,6 +3169,10 @@ class ModernMailSender(ctk.CTk):
         job_id = job["job_id"]
         key = job.get("task_key") or ""
         attn_key = f"attention_{job_id}"
+        existing = self.dialogs.get_open(attn_key)
+        if existing not in (None, True, "native") and is_widget_alive(existing):
+            self.dialogs.reveal_toplevel(existing, modal=True, key=attn_key)
+            return
         win = self.dialogs.open_toplevel(
             attn_key,
             title="발송 확인 필요",
@@ -3194,13 +3208,18 @@ class ModernMailSender(ctk.CTk):
 
         def refresh():
             live = current_job()
+            code = live.get("attention_code") or ""
             reason = live.get("attention_reason") or "사용자 확인이 필요합니다."
+            if code == "storage_before_smtp":
+                reason = reason + "\n데이터 폴더: " + os.path.dirname(os.path.abspath(self.db_path))
             attach = self.campaign_store.job_snapshot_attachments(live)
             missing = missing_attachment_paths(attach)
             reason_lbl.configure(text=reason)
             missing_box.configure(state="normal")
             missing_box.delete("1.0", "end")
-            if missing:
+            if code == "storage_before_smtp":
+                missing_box.insert("1.0", "메일은 아직 발송되지 않았습니다. 저장 위치가 복구되면 대기 중인 수신자부터 이어갑니다.")
+            elif missing:
                 missing_box.insert("1.0", "누락된 파일 경로:\n" + "\n".join(missing))
             else:
                 files = list((attach.get("files") or []))
@@ -3216,7 +3235,10 @@ class ModernMailSender(ctk.CTk):
                 child.destroy()
             items = list_review_items(self.campaign_store, job_id)
             if not items:
-                ctk.CTkLabel(list_host, text="확인할 수신자가 없습니다.", anchor="w").pack(fill="x", pady=4)
+                empty = "확인할 수신자가 없습니다."
+                if code == "storage_before_smtp":
+                    empty = "발송 전에 중단되어 확인할 수신자는 없습니다. 저장 상태를 다시 확인하세요."
+                ctk.CTkLabel(list_host, text=empty, anchor="w").pack(fill="x", pady=4)
             for it in items:
                 row = ctk.CTkFrame(list_host, fg_color="#1b2631")
                 row.pack(fill="x", pady=3)
@@ -3251,6 +3273,7 @@ class ModernMailSender(ctk.CTk):
                     fg_color="#7f8c8d",
                     command=lambda n=iid: on_item(n, ACTION_SKIP),
                 ).pack(side="right", padx=4, pady=6)
+            show_cause_buttons()
 
         def finish_if_released():
             live = current_job()
@@ -3332,15 +3355,55 @@ class ModernMailSender(ctk.CTk):
                 pass
             self._start_after_attention_release(job_id, key, JOB_CANCELLED)
 
-        ctk.CTkButton(btn_row, text="첨부파일 다시 지정", command=on_rebind_files).pack(side="left", padx=4)
-        ctk.CTkButton(btn_row, text="CID 이미지 다시 지정", command=on_rebind_cids).pack(side="left", padx=4)
+        def on_recheck_storage():
+            from db_access import assert_immediate_write
+
+            try:
+                assert_immediate_write(self.db_path, recovery=True)
+            except StorageWriteError as exc:
+                messagebox.showerror("저장 오류", str(exc), parent=win)
+                refresh()
+                return
+            finish_if_released()
+
+        def on_close_attention():
+            live = current_job()
+            if (live.get("attention_code") or "") == "storage_before_smtp":
+                on_recheck_storage()
+                if not self.dialogs.is_open(attn_key):
+                    return
+            self._close_managed_window(win, attn_key)
+
+        storage_btn = ctk.CTkButton(btn_row, text="저장 상태 다시 확인하고 계속", command=on_recheck_storage)
+        storage_btn.pack(side="left", padx=4)
+        file_btn = ctk.CTkButton(btn_row, text="첨부파일 다시 지정", command=on_rebind_files)
+        file_btn.pack(side="left", padx=4)
+        cid_btn = ctk.CTkButton(btn_row, text="CID 이미지 다시 지정", command=on_rebind_cids)
+        cid_btn.pack(side="left", padx=4)
+
+        def show_cause_buttons():
+            live = current_job()
+            code = live.get("attention_code") or ""
+            if code == "storage_before_smtp":
+                file_btn.pack_forget()
+                cid_btn.pack_forget()
+                storage_btn.pack(side="left", padx=4)
+            elif code in ("missing_attachment", "missing_cid"):
+                storage_btn.pack_forget()
+                file_btn.pack(side="left", padx=4)
+                cid_btn.pack(side="left", padx=4)
+            else:
+                storage_btn.pack(side="left", padx=4)
+                file_btn.pack(side="left", padx=4)
+                cid_btn.pack(side="left", padx=4)
         ctk.CTkButton(
             btn_row,
             text="캠페인 취소",
             fg_color="#922b21",
             command=on_cancel_job,
         ).pack(side="left", padx=4)
-        ctk.CTkButton(btn_row, text="닫기", fg_color="#566573", command=lambda: self._close_managed_window(win, attn_key)).pack(side="right", padx=4)
+        ctk.CTkButton(btn_row, text="닫기", fg_color="#566573", command=on_close_attention).pack(side="right", padx=4)
+        show_cause_buttons()
         refresh()
 
     def _ensure_campaign_job(self, p, i, title, body, s_name, data, interval, prevent_dup, apply_public_filter, template_name):
@@ -3475,6 +3538,13 @@ class ModernMailSender(ctk.CTk):
         return live_job
 
     def _start_campaign_runner(self, job_id, key, s_b=None, st_b=None):
+        from data_migrate import autosend_blocked
+
+        if autosend_blocked():
+            p, i = self._split_task_key(key)
+            self.write_log(p, i, "발송 기록을 선택하기 전에는 메일을 보내지 않습니다.")
+            self._prompt_database_choice()
+            return "storage_choice"
         lock = self._engine_locks.setdefault(key, threading.Lock())
         if not lock.acquire(blocking=False):
             p, i = self._split_task_key(key)
@@ -3669,19 +3739,63 @@ class ModernMailSender(ctk.CTk):
         if not self.campaign_store or self._recovery_started:
             return
         self._recovery_started = True
-        from data_migrate import autosend_blocked, last_migration_report
+        from data_migrate import autosend_blocked
 
         if autosend_blocked():
-            report = last_migration_report()
-            chosen = (report.choice_note if report else "") or self.db_path
+            self._prompt_database_choice()
+            return
+        self._resume_saved_campaigns()
+
+    def _prompt_database_choice(self):
+        from data_migrate import apply_database_choice, last_migration_report
+
+        report = last_migration_report()
+        if not report or not report.needs_choice:
             messagebox.showwarning(
                 "데이터 충돌",
-                "실행 폴더와 사용자 폴더에 서로 다른 발송 기록이 있습니다.\n"
-                "어느 쪽도 삭제하지 않았고, 활성 캠페인이 달라 자동발송을 시작하지 않습니다.\n\n"
-                f"사용 중인 폴더: {os.path.dirname(os.path.abspath(chosen))}",
+                (report.detail_note if report else "") or "발송 기록을 확인하지 못해 메일을 보내지 않습니다.",
                 parent=self,
             )
             return
+        key = "database_choice"
+        existing = self.dialogs.get_open(key)
+        if existing not in (None, True, "native") and is_widget_alive(existing):
+            self.dialogs.reveal_toplevel(existing, modal=True, key=key)
+            return
+        win = self.dialogs.open_toplevel(key, title="발송 기록 선택", geometry="760x560", modal=True)
+        if win is None or getattr(win, "_ui_dialog_built", False):
+            return
+        win._ui_dialog_built = True
+        ctk.CTkLabel(
+            win,
+            text=report.detail_note or "어느 캠페인을 이어갈지 선택하세요.",
+            font=self._font_small,
+            justify="left",
+            anchor="w",
+            wraplength=720,
+        ).pack(fill="both", expand=True, padx=12, pady=12)
+
+        def choose(which):
+            apply_database_choice(which)
+            try:
+                self._close_managed_window(win, key)
+            except Exception:
+                pass
+            if self.campaign_store and os.path.isfile(self.db_path):
+                self._resume_saved_campaigns()
+
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=(0, 12))
+        ctk.CTkButton(row, text="사용자 폴더의 캠페인 사용", command=lambda: choose("primary")).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="기존 위치의 캠페인 사용", command=lambda: choose("secondary")).pack(side="left", padx=4)
+        ctk.CTkButton(
+            row,
+            text="닫기",
+            fg_color="#566573",
+            command=lambda: self._close_managed_window(win, key),
+        ).pack(side="right", padx=4)
+
+    def _resume_saved_campaigns(self):
         uid = self.login_user_id or ""
         try:
             attention = self.campaign_store.list_attention_workers(uid)

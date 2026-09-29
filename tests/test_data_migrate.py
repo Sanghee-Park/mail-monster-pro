@@ -58,6 +58,7 @@ class DataMigrateTests(unittest.TestCase):
             "templates.json": "{}",
             "user_profiles.json": "{}",
             "extra_holidays.json": '{"dates":[]}',
+            "send_recovery_journal.json": '{"entries":[]}',
         }
         for name, text in names.items():
             (self.src / name).write_text(text, encoding="utf-8")

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
-from campaign_attachments import format_missing_files_reason, missing_attachment_paths
+from campaign_attachments import format_missing_files_reason, missing_attachment_paths, missing_attention_code
 from campaign_store import (
     ITEM_NEEDS_REVIEW,
     ITEM_PENDING,
@@ -134,11 +134,25 @@ def maybe_release_attention(
         return st0
     if store.count_by_status(job_id, ITEM_NEEDS_REVIEW) > 0:
         n = store.count_by_status(job_id, ITEM_NEEDS_REVIEW)
-        store.set_needs_attention(job_id, f"확인이 필요한 수신자가 {n}건 남아 있습니다.", now=now)
+        code = job.get("attention_code") or ""
+        if code not in ("delivery_uncertain",):
+            code = "legacy_queue_review"
+        store.set_needs_attention(
+            job_id,
+            f"확인이 필요한 수신자가 {n}건 남아 있습니다.",
+            now=now,
+            attention_code=code,
+        )
         return JOB_NEEDS_ATTENTION
-    missing = missing_attachment_paths(store.job_snapshot_attachments(job))
+    attach = store.job_snapshot_attachments(job)
+    missing = missing_attachment_paths(attach)
     if missing:
-        store.set_needs_attention(job_id, format_missing_files_reason(missing), now=now)
+        store.set_needs_attention(
+            job_id,
+            format_missing_files_reason(missing),
+            now=now,
+            attention_code=missing_attention_code(attach, missing),
+        )
         return JOB_NEEDS_ATTENTION
     pending = store.count_by_status(job_id, ITEM_PENDING)
     sending = store.count_by_status(job_id, ITEM_SENDING)

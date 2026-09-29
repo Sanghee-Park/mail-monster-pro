@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import time
@@ -216,9 +217,9 @@ def connect(path: str, *, kind: str = "발송 기록", _readonly_retried: bool =
     return ManagedConnection(raw, path, kind)
 
 
-def assert_immediate_write(path: str, *, kind: str = "발송 기록") -> None:
-    """SMTP 직전에 쓰기 잠금을 한 번 잡고 바로 되돌린다."""
-    if writes_blocked():
+def assert_immediate_write(path: str, *, kind: str = "발송 기록", recovery: bool = False) -> None:
+    """SMTP 직전 또는 복구 버튼에서 SQLite 쓰기 잠금을 확인한다."""
+    if writes_blocked() and not recovery:
         raise StorageWriteError(
             kind,
             os.path.dirname(os.path.abspath(path)) or ".",
@@ -240,6 +241,386 @@ def assert_immediate_write(path: str, *, kind: str = "발송 기록") -> None:
             con.close()
         except Exception:
             pass
+    if recovery:
+        reset_write_block()
+
+
+_INVENTORY_TABLES = ("sent_log", "campaign_jobs", "campaign_workers", "campaign_queue", "blacklist")
+
+
+def _table_names(con: sqlite3.Connection) -> set:
+    return {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def _quick_check_ok(con: sqlite3.Connection) -> bool:
+    row = con.execute("PRAGMA quick_check").fetchone()
+    return bool(row) and str(row[0]).lower() == "ok"
+
+
+def _table_counts(con: sqlite3.Connection) -> dict:
+    names = _table_names(con)
+    counts = {}
+    for table in _INVENTORY_TABLES:
+        if table not in names:
+            counts[table] = 0
+            continue
+        counts[table] = int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    return counts
+
+
+def database_inventory(path: str) -> dict:
+    """행 수와 내용 지문. 안내 문구에는 이메일 원문을 넣지 않는다."""
+    con = sqlite3.connect(os.path.abspath(path))
+    try:
+        ok = _quick_check_ok(con)
+        names = _table_names(con)
+        counts = _table_counts(con)
+        pending = 0
+        active = []
+        if "campaign_queue" in names:
+            pending = int(
+                con.execute("SELECT COUNT(*) FROM campaign_queue WHERE status=?", ("pending",)).fetchone()[0]
+            )
+        if "campaign_jobs" in names:
+            active = [
+                (str(row[0]), str(row[1]))
+                for row in con.execute(
+                    """
+                    SELECT job_id, status FROM campaign_jobs
+                    WHERE status IN ('queued','running','scheduled_pause','needs_attention','user_stopped','storage_blocked')
+                    ORDER BY job_id
+                    """
+                )
+            ]
+        signatures = {}
+        for table in _INVENTORY_TABLES:
+            if table not in names:
+                signatures[table] = ""
+                continue
+            cols = [row[1] for row in con.execute(f"PRAGMA table_info({table})")]
+            if not cols:
+                signatures[table] = ""
+                continue
+            quoted = ", ".join(cols)
+            rows = con.execute(f"SELECT {quoted} FROM {table} ORDER BY {quoted}").fetchall()
+            blob = repr(tuple(tuple("" if col is None else str(col) for col in row) for row in rows)).encode("utf-8")
+            signatures[table] = hashlib.sha256(blob).hexdigest()
+        return {"ok": ok, "counts": counts, "pending": pending, "active": active, "signatures": signatures}
+    finally:
+        con.close()
+
+
+_ACTIVE_JOB_STATUSES = (
+    "queued",
+    "running",
+    "scheduled_pause",
+    "needs_attention",
+    "user_stopped",
+    "storage_blocked",
+)
+_QUEUE_STATUSES = ("pending", "sending", "needs_review")
+
+
+def database_profile(path: str) -> dict:
+    """충돌 화면에 보여줄 건수. 이메일 원문은 넣지 않는다."""
+    abs_path = os.path.abspath(path)
+    info = {
+        "path": abs_path,
+        "mtime": "",
+        "sent_log": 0,
+        "blacklist": 0,
+        "active_campaigns": 0,
+        "pending": 0,
+        "sending": 0,
+        "needs_review": 0,
+        "active_jobs": [],
+        "ok": False,
+    }
+    if not os.path.isfile(abs_path):
+        return info
+    try:
+        info["mtime"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(abs_path)))
+    except OSError:
+        info["mtime"] = ""
+    con = sqlite3.connect(abs_path)
+    try:
+        info["ok"] = _quick_check_ok(con)
+        names = _table_names(con)
+        if "sent_log" in names:
+            info["sent_log"] = int(con.execute("SELECT COUNT(*) FROM sent_log").fetchone()[0])
+        if "blacklist" in names:
+            info["blacklist"] = int(con.execute("SELECT COUNT(*) FROM blacklist").fetchone()[0])
+        if "campaign_queue" in names:
+            for status in _QUEUE_STATUSES:
+                info[status] = int(
+                    con.execute("SELECT COUNT(*) FROM campaign_queue WHERE status=?", (status,)).fetchone()[0]
+                )
+        if "campaign_jobs" in names:
+            marks = ",".join("?" * len(_ACTIVE_JOB_STATUSES))
+            rows = con.execute(
+                f"""
+                SELECT job_id, COALESCE(login_user_id,''), COALESCE(task_key,''), status
+                FROM campaign_jobs
+                WHERE status IN ({marks})
+                ORDER BY task_key, job_id
+                """,
+                _ACTIVE_JOB_STATUSES,
+            ).fetchall()
+            info["active_jobs"] = [
+                {"job_id": str(row[0]), "login_user_id": str(row[1]), "task_key": str(row[2]), "status": str(row[3])}
+                for row in rows
+            ]
+            info["active_campaigns"] = len(info["active_jobs"])
+        return info
+    finally:
+        con.close()
+
+
+def format_database_profile(label: str, info: dict) -> str:
+    return (
+        f"{label}\n"
+        f"경로: {info.get('path') or ''}\n"
+        f"마지막 변경 시각: {info.get('mtime') or '-'}\n"
+        f"sent_log: {int(info.get('sent_log') or 0)}건\n"
+        f"blacklist: {int(info.get('blacklist') or 0)}건\n"
+        f"활성 캠페인: {int(info.get('active_campaigns') or 0)}건\n"
+        f"pending: {int(info.get('pending') or 0)}건, "
+        f"sending: {int(info.get('sending') or 0)}건, "
+        f"needs_review: {int(info.get('needs_review') or 0)}건"
+    )
+
+
+def conflicting_task_keys(left: dict, right: dict) -> list:
+    """같은 task_key 에 서로 다른 활성 캠페인이 있으면 그 키를 반환한다."""
+    by_left = {}
+    for job in left.get("active_jobs") or []:
+        key = str(job.get("task_key") or "")
+        if key:
+            by_left.setdefault(key, set()).add(str(job.get("job_id") or ""))
+    found = []
+    for job in right.get("active_jobs") or []:
+        key = str(job.get("task_key") or "")
+        if not key or key not in by_left:
+            continue
+        ids = by_left[key]
+        if str(job.get("job_id") or "") not in ids or len(ids) > 1:
+            found.append(key)
+    return sorted(set(found))
+
+
+def _sent_identity(row: dict) -> tuple:
+    message_id = str(row.get("message_id") or "").strip()
+    if message_id:
+        return ("message_id", message_id)
+    email = str(row.get("normalized_email") or row.get("email") or "").strip().lower()
+    return (
+        "composite",
+        str(row.get("account_id") or "").strip().lower(),
+        str(row.get("task_key") or ""),
+        email,
+        str(row.get("content_hash") or "").strip().lower(),
+        str(row.get("template_name") or "").strip().lower(),
+        str(row.get("sent_at") or ""),
+        str(row.get("subject") or ""),
+    )
+
+
+def _table_columns(con: sqlite3.Connection, table: str) -> list:
+    if table not in _table_names(con):
+        return []
+    return [row[1] for row in con.execute(f"PRAGMA table_info({table})")]
+
+
+def _ensure_table_from(dst: sqlite3.Connection, src: sqlite3.Connection, table: str) -> None:
+    if table in _table_names(dst):
+        return
+    row = src.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    if row and row[0]:
+        dst.execute(row[0])
+
+
+def _ensure_columns(con: sqlite3.Connection, table: str, columns: list) -> None:
+    have = set(_table_columns(con, table))
+    if not have:
+        return
+    for name in columns:
+        if name in have or name == "id":
+            continue
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {name} TEXT")
+
+
+def _select_dicts(con: sqlite3.Connection, table: str) -> list:
+    cols = _table_columns(con, table)
+    if not cols:
+        return []
+    quoted = ", ".join(cols)
+    return [dict(zip(cols, row)) for row in con.execute(f"SELECT {quoted} FROM {table}")]
+
+
+def _insert_dict(con: sqlite3.Connection, table: str, row: dict, columns: list) -> None:
+    usable = [name for name in columns if name in row and name != "id"]
+    if not usable:
+        return
+    marks = ", ".join("?" * len(usable))
+    names = ", ".join(usable)
+    con.execute(f"INSERT INTO {table}({names}) VALUES ({marks})", [row.get(name) for name in usable])
+
+
+def merge_user_databases(base_path: str, other_path: str, dest_path: str) -> dict:
+    """캠페인 기준 DB에 상대 sent_log·blacklist 합집합을 넣고 dest 로 원자 교체한다."""
+    tmp = dest_path + ".mm_merge_tmp"
+    for extra in (tmp, tmp + "-wal", tmp + "-shm"):
+        try:
+            if os.path.isfile(extra):
+                os.remove(extra)
+        except OSError:
+            pass
+    backup_database(base_path, tmp)
+    base = sqlite3.connect(tmp)
+    other = sqlite3.connect(os.path.abspath(other_path))
+    try:
+        base.execute("PRAGMA foreign_keys=OFF")
+        sent_keys = set()
+        for row in _select_dicts(base, "sent_log"):
+            sent_keys.add(_sent_identity(row))
+        other_sent = _select_dicts(other, "sent_log")
+        if other_sent:
+            _ensure_table_from(base, other, "sent_log")
+            _ensure_columns(base, "sent_log", list(other_sent[0].keys()))
+            dest_cols = _table_columns(base, "sent_log")
+            for row in other_sent:
+                key = _sent_identity(row)
+                if key in sent_keys:
+                    continue
+                _insert_dict(base, "sent_log", row, dest_cols)
+                sent_keys.add(key)
+        seen_email = set()
+        for row in _select_dicts(base, "blacklist"):
+            seen_email.add(str(row.get("email") or "").strip().lower())
+        other_black = _select_dicts(other, "blacklist")
+        if other_black:
+            _ensure_table_from(base, other, "blacklist")
+            _ensure_columns(base, "blacklist", list(other_black[0].keys()))
+            dest_cols = _table_columns(base, "blacklist")
+            for row in other_black:
+                email = str(row.get("email") or "").strip().lower()
+                if not email or email in seen_email:
+                    continue
+                _insert_dict(base, "blacklist", row, dest_cols)
+                seen_email.add(email)
+        base_tasks = {str(job.get("task_key") or "") for job in database_profile(base_path).get("active_jobs") or []}
+        other_jobs = [
+            job
+            for job in _select_dicts(other, "campaign_jobs")
+            if str(job.get("status") or "") in _ACTIVE_JOB_STATUSES
+            and str(job.get("task_key") or "")
+            and str(job.get("task_key") or "") not in base_tasks
+        ]
+        copied_jobs = []
+        if other_jobs:
+            _ensure_table_from(base, other, "campaign_jobs")
+            _ensure_columns(base, "campaign_jobs", list(other_jobs[0].keys()))
+            job_cols = _table_columns(base, "campaign_jobs")
+            known_jobs = {str(row.get("job_id") or "") for row in _select_dicts(base, "campaign_jobs")}
+            for job in other_jobs:
+                if str(job.get("job_id") or "") in known_jobs:
+                    continue
+                _insert_dict(base, "campaign_jobs", job, job_cols)
+                copied_jobs.append(str(job.get("job_id") or ""))
+            if copied_jobs:
+                for table in ("campaign_workers", "campaign_queue"):
+                    rows = [
+                        row
+                        for row in _select_dicts(other, table)
+                        if str(row.get("job_id") or "") in copied_jobs
+                    ]
+                    if not rows:
+                        continue
+                    _ensure_table_from(base, other, table)
+                    _ensure_columns(base, table, list(rows[0].keys()))
+                    cols = _table_columns(base, table)
+                    for row in rows:
+                        _insert_dict(base, table, row, cols)
+        for row in _select_dicts(other, "send_reservations"):
+            _ensure_table_from(base, other, "send_reservations")
+            break
+        if "send_reservations" in _table_names(base) and "send_reservations" in _table_names(other):
+            have = {
+                (
+                    str(row.get("login_user_id") or "").strip().lower(),
+                    str(row.get("normalized_email") or "").strip().lower(),
+                    str(row.get("content_hash") or "").strip().lower(),
+                )
+                for row in _select_dicts(base, "send_reservations")
+            }
+            rows = _select_dicts(other, "send_reservations")
+            if rows:
+                _ensure_columns(base, "send_reservations", list(rows[0].keys()))
+                cols = _table_columns(base, "send_reservations")
+                for row in rows:
+                    key = (
+                        str(row.get("login_user_id") or "").strip().lower(),
+                        str(row.get("normalized_email") or "").strip().lower(),
+                        str(row.get("content_hash") or "").strip().lower(),
+                    )
+                    if key in have:
+                        continue
+                    _insert_dict(base, "send_reservations", row, cols)
+                    have.add(key)
+        base.commit()
+        if not _quick_check_ok(base):
+            raise sqlite3.DatabaseError("통합 데이터베이스 무결성 검사에 실패했습니다.")
+        merged_now = database_profile(tmp)
+        base_now = database_profile(base_path)
+        base_ids = {str(job.get("job_id") or "") for job in base_now.get("active_jobs") or []}
+        merged_ids = {str(job.get("job_id") or "") for job in merged_now.get("active_jobs") or []}
+        if not base_ids <= merged_ids:
+            raise sqlite3.DatabaseError("통합 데이터베이스에 활성 캠페인이 빠졌습니다.")
+        if int(merged_now.get("sent_log") or 0) < len(sent_keys) or int(merged_now.get("blacklist") or 0) < len(seen_email):
+            raise sqlite3.DatabaseError("통합 데이터베이스 행 수가 예상과 다릅니다.")
+        if int(merged_now.get("pending") or 0) < int(base_now.get("pending") or 0):
+            raise sqlite3.DatabaseError("통합 데이터베이스의 대기 수신자가 줄었습니다.")
+    except Exception:
+        try:
+            base.close()
+        except Exception:
+            pass
+        try:
+            other.close()
+        except Exception:
+            pass
+        for extra in (tmp, tmp + "-wal", tmp + "-shm"):
+            try:
+                if os.path.isfile(extra):
+                    os.remove(extra)
+            except OSError:
+                pass
+        raise
+    base.close()
+    other.close()
+    try:
+        live = sqlite3.connect(os.path.abspath(dest_path))
+        try:
+            live.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            live.close()
+    except sqlite3.Error:
+        pass
+    for extra in (dest_path + "-wal", dest_path + "-shm"):
+        try:
+            if os.path.isfile(extra):
+                os.remove(extra)
+        except OSError:
+            pass
+    os.replace(tmp, dest_path)
+    clear_readonly(dest_path)
+    for extra in (tmp + "-wal", tmp + "-shm"):
+        try:
+            if os.path.isfile(extra):
+                os.remove(extra)
+        except OSError:
+            pass
+    return database_profile(dest_path)
 
 
 def backup_database(src: str, dest: str) -> None:
@@ -250,8 +631,14 @@ def backup_database(src: str, dest: str) -> None:
     src_con = sqlite3.connect(os.path.abspath(src))
     dst_con = sqlite3.connect(tmp)
     try:
+        if not _quick_check_ok(src_con):
+            raise sqlite3.DatabaseError("원본 데이터베이스 무결성 검사에 실패했습니다.")
         src_con.backup(dst_con)
         dst_con.commit()
+        if not _quick_check_ok(dst_con):
+            raise sqlite3.DatabaseError("복사한 데이터베이스 무결성 검사에 실패했습니다.")
+        if _table_counts(src_con) != _table_counts(dst_con):
+            raise sqlite3.DatabaseError("복사한 데이터베이스 행 수가 원본과 다릅니다.")
     except Exception:
         try:
             dst_con.close()
@@ -318,8 +705,9 @@ def mark_journal_applied(item_id) -> None:
 
 def journal_blocks_item(item_id) -> bool:
     for row in load_recovery_journal():
-        if str(row.get("item_id")) == str(item_id) and row.get("status") != "restored":
-            return True
-        if str(row.get("item_id")) == str(item_id) and row.get("smtp_phase") in ("after", "uncertain", "before"):
-            return True
+        if str(row.get("item_id")) != str(item_id):
+            continue
+        if row.get("smtp_phase") == "before":
+            return False
+        return True
     return False

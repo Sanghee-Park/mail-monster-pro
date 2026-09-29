@@ -231,6 +231,7 @@ class SqliteStorageTests(unittest.TestCase):
         os.chmod(src / "sent_history.db", stat.S_IREAD)
         os.environ.pop(DATA_DIR_ENV, None)
         os.environ["LOCALAPPDATA"] = str(local)
+        os.environ["MAILMONSTER_SCAN_CLOUD"] = "0"
         reset_prepare_cache()
         from json_atomic import clear_readonly as real_clear
         from json_atomic import file_allows_write as real_allows
@@ -277,6 +278,7 @@ class SqliteStorageTests(unittest.TestCase):
         (dest_root / "sent_history.db").write_bytes(b"DESTDB")
         os.environ.pop(DATA_DIR_ENV, None)
         os.environ["LOCALAPPDATA"] = str(local)
+        os.environ["MAILMONSTER_SCAN_CLOUD"] = "0"
         reset_prepare_cache()
         from json_atomic import clear_readonly as real_clear
         from json_atomic import file_allows_write as real_allows
@@ -309,6 +311,7 @@ class SqliteStorageTests(unittest.TestCase):
         src_db = (src / "sent_history.db").read_bytes()
         os.environ.pop(DATA_DIR_ENV, None)
         os.environ["LOCALAPPDATA"] = str(local)
+        os.environ["MAILMONSTER_SCAN_CLOUD"] = "0"
         reset_prepare_cache()
         real_isfile = os.path.isfile
 

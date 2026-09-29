@@ -271,6 +271,16 @@ class UiDialogTests(unittest.TestCase):
         self.assertEqual(len(self.wins), 1)
         self.assertGreater(w2.lifts, lifts)
 
+    def test_attention_dialog_stays_one_per_job(self):
+        first = self.mgr.open_toplevel("attention_job", title="발송 확인 필요", modal=True)
+        for _ in range(5):
+            again = self.mgr.open_toplevel("attention_job", title="발송 확인 필요", modal=True)
+            self.assertIs(again, first)
+        self.assertEqual(len(self.wins), 1)
+        self.mgr.close_toplevel(first, key="attention_job")
+        self.assertFalse(self.mgr.is_open("attention_job"))
+        self.assertIsNone(self.mgr.grab_current())
+
     def test_nested_native_dialog_does_not_open_second(self):
         nested = []
 

@@ -25,6 +25,60 @@ def install_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def storage_block_reason(path: str, *, explicit: bool = False) -> Optional[str]:
+    """SQLite를 두면 안 되는 경로면 한국어 사유를 반환한다."""
+    if not path:
+        return "경로가 비어 있습니다."
+    try:
+        norm = os.path.normcase(os.path.abspath(path))
+    except OSError:
+        return "경로를 확인할 수 없습니다."
+    if norm.startswith("\\\\") or norm.startswith("//"):
+        return "네트워크 경로에는 발송 기록을 저장하지 않습니다."
+    folded = norm.replace("/", "\\")
+    for token in ("\\onedrive\\", "\\onedrivecommercial\\", "\\onedriveconsumer\\", "\\onedrive -"):
+        if token in folded:
+            return "OneDrive 폴더에는 발송 기록을 저장하지 않습니다."
+    for env_name in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env_name) or ""
+        if base and folded.startswith(os.path.normcase(os.path.abspath(base))):
+            return "Program Files에는 발송 기록을 저장하지 않습니다."
+    if not explicit:
+        official = ""
+        try:
+            official = os.path.normcase(local_app_data_dir())
+        except OSError:
+            official = ""
+        if official and (folded == official or folded.startswith(official + "\\")):
+            return None
+        for env_name in ("TEMP", "TMP"):
+            base = os.environ.get(env_name) or ""
+            if base and folded.startswith(os.path.normcase(os.path.abspath(base))):
+                return "임시 폴더에는 발송 기록을 저장하지 않습니다."
+        try:
+            if os.path.normcase(os.path.abspath(install_dir())) == folded:
+                return "실행 파일 폴더에는 발송 기록을 저장하지 않습니다."
+        except OSError:
+            pass
+    if os.name == "nt":
+        drive = os.path.splitdrive(norm)[0]
+        if drive:
+            try:
+                import ctypes
+
+                kind = ctypes.windll.kernel32.GetDriveTypeW(drive + "\\")
+                if kind == 4:
+                    return "네트워크 드라이브에는 발송 기록을 저장하지 않습니다."
+            except Exception:
+                pass
+    return None
+
+
+def local_app_data_dir() -> str:
+    local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.abspath(os.path.join(local, APP_DATA_FOLDER))
+
+
 def resource_dir() -> str:
     """PyInstaller가 풀은 읽기 전용 리소스(예: extra_holidays.example.json)."""
     if is_frozen():
